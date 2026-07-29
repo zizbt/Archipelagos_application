@@ -1,3 +1,23 @@
+# PROJECT DATA
+data/
+WDPA/
+ZEE_and_territorial_water/
+V1 fonctionnelle/
+*.csv
+*.parquet
+*.geojson
+
+# Shapefiles
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.qpj
+
+# Generated maps
+*.html
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
