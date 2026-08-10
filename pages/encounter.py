@@ -30,6 +30,8 @@ from shared import AEGEAN_CENTER
 from config import YEARS, FLAG_NAMES
 from loader import load_trajectories_range
 
+TRAJECTORY_COLUMNS = ["lat", "lon", "vessel_id", "ship_name", "date"]
+
 # Bornes de dates de l'app
 GLOBAL_MIN_DATE = date(YEARS[0], 1, 1)
 GLOBAL_MAX_DATE = date(YEARS[-1], 12, 31)
@@ -41,9 +43,6 @@ TIME_THRESHOLD_H = 2
 ENC_COLOR = [255, 0, 200, 180]   # rose/violet, comme tes points d'origine
 
 
-# ---------------------------------------------------------------------------
-# CALCUL DES RENCONTRES (logique reprise de VP_bulk_map.get_encounters_dataframe)
-# ---------------------------------------------------------------------------
 def get_encounters_dataframe(df, dist_threshold_meters=DIST_THRESHOLD_M,
                              time_threshold_hours=TIME_THRESHOLD_H):
     empty_cols = ['vessel_1', 'vessel_2', 'vessel_1_id', 'vessel_2_id',
@@ -53,22 +52,33 @@ def get_encounters_dataframe(df, dist_threshold_meters=DIST_THRESHOLD_M,
     if df is None or df.empty or 'vessel_id' not in df.columns:
         return pd.DataFrame(columns=empty_cols)
 
-    gdf = gpd.GeoDataFrame(df.copy(), geometry=gpd.points_from_xy(df.lon, df.lat), crs="EPSG:4326")
+    gdf = gpd.GeoDataFrame(df.copy(), geometry=gpd.points_from_xy(df.lon, df.lat),
+                           crs="EPSG:4326")
     gdf_metric = gdf.to_crs("EPSG:32634")
     gdf_metric['date'] = pd.to_datetime(gdf_metric['date'])
-    gdf_metric = gdf_metric[['vessel_id', 'ship_name', 'date', 'geometry']]
+    gdf_metric = gdf_metric[['vessel_id', 'ship_name', 'date', 'geometry']].copy()
+
+    gdf_metric['x'] = gdf_metric.geometry.x
+    gdf_metric['y'] = gdf_metric.geometry.y
+
+    gdf_metric['tbucket'] = gdf_metric['date'].dt.floor('30min')
 
     gdf_buffered = gdf_metric.copy()
     gdf_buffered['geometry'] = gdf_buffered.geometry.buffer(dist_threshold_meters)
 
     spatial_join = gpd.sjoin(gdf_metric, gdf_buffered, how='inner', predicate='within')
-    pairs = spatial_join[spatial_join['vessel_id_left'] < spatial_join['vessel_id_right']].copy()
+
+    pairs = spatial_join[
+        spatial_join['vessel_id_left'] < spatial_join['vessel_id_right']
+    ].copy()
+    
+    pairs = pairs[pairs['tbucket_left'] == pairs['tbucket_right']]
     if pairs.empty:
         return pd.DataFrame(columns=empty_cols)
 
-    right_geom = gdf_metric.geometry
-    pairs['geom_right'] = pairs['index_right'].map(right_geom)
-    pairs['dist_m'] = pairs.geometry.distance(gpd.GeoSeries(pairs['geom_right'], crs=gdf_metric.crs))
+    right_xy = gdf_metric[['x', 'y']].rename(columns={'x': 'x_r', 'y': 'y_r'})
+    pairs = pairs.merge(right_xy, left_on='index_right', right_index=True, how='left')
+    pairs['dist_m'] = np.hypot(pairs['x'] - pairs['x_r'], pairs['y'] - pairs['y_r'])
 
     pairs['time_diff'] = (pairs['date_left'] - pairs['date_right']).abs()
     close_pairs = pairs[pairs['time_diff'] <= pd.Timedelta(minutes=30)].copy()
@@ -118,10 +128,7 @@ def get_encounters_dataframe(df, dist_threshold_meters=DIST_THRESHOLD_M,
         return pd.DataFrame(columns=empty_cols)
     return pd.DataFrame(rows).sort_values('start').reset_index(drop=True)
 
-
-# ---------------------------------------------------------------------------
 # LAYOUT
-# ---------------------------------------------------------------------------
 def layout():
     return html.Div([
         dcc.Store(id="enc-store", data=None),
@@ -191,9 +198,7 @@ def layout():
     ], style={"display": "flex", "height": "calc(100vh - 52px)"})
 
 
-# ---------------------------------------------------------------------------
 # HELPERS carte + table
-# ---------------------------------------------------------------------------
 def _build_map(enc_df):
     layers = []
     if enc_df is not None and not enc_df.empty:
@@ -245,9 +250,7 @@ def _table(enc_df):
     )
 
 
-# ---------------------------------------------------------------------------
 # CALLBACKS
-# ---------------------------------------------------------------------------
 def register_callbacks(app):
 
     # Raccourci "annee" -> remplit start/end
@@ -262,7 +265,7 @@ def register_callbacks(app):
             raise dash.exceptions.PreventUpdate
         return date(year, 1, 1), date(year, 1, 31)
 
-    # Analyze
+    # Analyze -- se declenche UNIQUEMENT au clic sur le bouton
     @app.callback(
         Output("enc-map-container", "children"),
         Output("enc-table", "children"),
@@ -277,7 +280,7 @@ def register_callbacks(app):
         if not n:
             raise dash.exceptions.PreventUpdate
 
-        df = load_trajectories_range(start, end, None, None)
+        df = load_trajectories_range(start, end, None, None, columns=TRAJECTORY_COLUMNS)
         if df is None or df.empty:
             return _build_map(None), _table(None), "No trajectory data for this range.", None
 
@@ -288,7 +291,7 @@ def register_callbacks(app):
                            end=enc["end"].astype(str)).to_dict("records") if not enc.empty else None
         return _build_map(enc), _table(enc), summary, store
 
-    # Export CSV
+    # CSV Export
     @app.callback(
         Output("enc-download-csv", "data"),
         Input("enc-btn-export", "n_clicks"),

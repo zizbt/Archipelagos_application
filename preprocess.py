@@ -169,7 +169,7 @@ def compute_trajectories():
                 where = " AND ".join(conds)
 
                 sql = f"""
-                    SELECT vessel_id, vessel_type, flag, ship_name, lat, lon, date
+                    SELECT vessel_id, vessel_type, gear_type, flag, ship_name, lat, lon, date
                     FROM read_parquet('{PARQUET_GLOB}', hive_partitioning=true)
                     WHERE {where}
                     ORDER BY vessel_id, date

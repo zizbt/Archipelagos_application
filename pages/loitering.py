@@ -28,6 +28,8 @@ from shared import BG, PANEL, BDR, DIM, MAIN, SOFT, ACC, MAPBOX_KEY, lbl, AEGEAN
 from config import YEARS
 from loader import load_trajectories_range
 
+TRAJECTORY_COLUMNS = ["lat", "lon", "vessel_id", "ship_name", "date"]
+
 GLOBAL_MIN_DATE = date(YEARS[0], 1, 1)
 GLOBAL_MAX_DATE = date(YEARS[-1], 12, 31)
 
@@ -285,7 +287,7 @@ def register_callbacks(app):
         if not n:
             raise dash.exceptions.PreventUpdate
 
-        df = load_trajectories_range(start, end, None, None)
+        df = load_trajectories_range(start, end, None, None, columns=TRAJECTORY_COLUMNS)
         if df is None or df.empty:
             return _build_map(None), _table(None), "No trajectory data for this range.", None
 

@@ -6,6 +6,7 @@ All functions return pandas DataFrames or dicts ready to use.
 """
 
 import json
+from functools import lru_cache
 import duckdb
 import pandas as pd
 from pathlib import Path
@@ -15,6 +16,25 @@ from config import (
 )
 
 PARQUET_GLOB = str(RAW_DATA / "**" / "*.parquet")
+
+
+def _normalize_columns(columns):
+    if not columns:
+        return None
+    return tuple(columns)
+
+
+@lru_cache(maxsize=256)
+def _read_parquet_cached(path_str, columns_key):
+    path = Path(path_str)
+    columns = list(columns_key) if columns_key else None
+    try:
+        if columns is None:
+            return pd.read_parquet(path)
+        return pd.read_parquet(path, columns=columns)
+    except Exception:
+        # Fall back to a full read if the requested subset is not available.
+        return pd.read_parquet(path)
 
 
 # ── Maritime zones ─────────────────────────────────────────────────────────────
@@ -80,7 +100,7 @@ def load_marine_protected_areas():
 
 # ── Heatmaps ───────────────────────────────────────────────────────────────────
 
-def load_heatmap(year, season, vessel_type=None):
+def load_heatmap(year, season, vessel_type=None, columns=None):
     """
     Loads lat/lon points for a precomputed heatmap.
     vessel_type=None -> all types combined.
@@ -90,12 +110,12 @@ def load_heatmap(year, season, vessel_type=None):
     path = HEATMAP_DIR / fname
     if not path.exists():
         return pd.DataFrame(columns=["lat", "lon"])
-    return pd.read_parquet(path)
+    return _read_parquet_cached(str(path), _normalize_columns(columns))
 
 
 # ── Precomputed trajectories ────────────────────────────────────────────────────
 
-def load_trajectories(year, month, vessel_type=None):
+def load_trajectories(year, month, vessel_type=None, columns=None):
     """
     Loads precomputed trajectories for a year + month.
     vessel_type=None -> all types combined.
@@ -105,7 +125,7 @@ def load_trajectories(year, month, vessel_type=None):
     path = TRAJECTORY_DIR / fname
     if not path.exists():
         return pd.DataFrame()
-    return pd.read_parquet(path)
+    return _read_parquet_cached(str(path), _normalize_columns(columns))
 
 
 def load_trajectories_filtered(year, month, vessel_type=None, flags=None):
@@ -126,7 +146,7 @@ def load_trajectories_date(year, month, day, vessel_type=None, flags=None):
     Loads trajectories for a precise date (day within the month).
     Filter applied in memory from the precomputed month file.
     """
-    df = load_trajectories(year, month, vessel_type)
+    df = load_trajectories(year, month, vessel_type).copy()
     if df.empty:
         return df
     df["date"] = pd.to_datetime(df["date"])
@@ -136,7 +156,7 @@ def load_trajectories_date(year, month, day, vessel_type=None, flags=None):
     return df
 
 
-def load_trajectories_range(start_date, end_date, vessel_types=None, flags=None):
+def load_trajectories_range(start_date, end_date, vessel_types=None, flags=None, columns=None):
     """
     Charge les trajectoires précalculées sur une plage de dates arbitraire
     (peut chevaucher plusieurs mois / plusieurs fichiers).
@@ -154,7 +174,7 @@ def load_trajectories_range(start_date, end_date, vessel_types=None, flags=None)
     frames = []
     for period in months:
         for vt in types_to_load:
-            df = load_trajectories(period.year, period.month, vt)
+            df = load_trajectories(period.year, period.month, vt, columns=columns)
             if not df.empty:
                 frames.append(df)
 

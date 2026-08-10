@@ -41,6 +41,7 @@ from gfw import list_downloaded_csvs, load_csv, GEAR_TYPES
 MAX_POINTS = 60_000    # max number of points shown as scatter (sampled beyond that)
 MAX_PATHS_FAST = 500   # max number of vessels drawn as paths in "fast" mode (checkbox unticked)
 MAX_PTS_PER_PATH = 80  # max number of points per path (decimation, keeps the overall shape)
+TRAJECTORY_COLUMNS = ["lat", "lon", "vessel_id", "ship_name", "date", "flag", "vessel_type", "gear_type"]
 
 # The full range of dates the app has data for -- the start/end date pickers
 # are bounded by this instead of by a single calendar year, so a selection
@@ -87,35 +88,68 @@ def _legend_subtitle(text):
                                 "margin": "0.6rem 0 0.35rem 0"})
 
 
+def _vessel_type_checklist():
+    """Returns a checklist of vessel types with colored dots, plus a "select all"""
+    type_options = []
+    for t in VESSEL_TYPES:
+        c = TYPE_COLORS.get(t, DEFAULT_COLOR)
+        dot = html.Span(style={
+            "display": "inline-block", "width": "11px", "height": "11px",
+            "borderRadius": "50%", "marginRight": "7px",
+            "backgroundColor": f"rgba({c[0]},{c[1]},{c[2]},{(c[3]/255) if len(c) > 3 else 1})",
+            "verticalAlign": "middle",
+        })
+        label = html.Span([dot, t.capitalize()],
+                          style={"fontSize": "0.72rem", "color": SOFT,
+                                 "verticalAlign": "middle"})
+        type_options.append({"label": label, "value": t})
+
+    select_all = html.Button(
+        "Deselect all",
+        id="map-type-select-all",
+        n_clicks=0,
+        style={"fontSize": "0.7rem", "color": SOFT, "background": "none",
+               "border": f"1px solid {BDR}", "borderRadius": "4px",
+               "padding": "3px 8px", "marginBottom": "6px", "cursor": "pointer"},
+    )
+
+    checklist = dcc.Checklist(
+        id="map-type-filter",
+        options=type_options,
+        value=list(VESSEL_TYPES),
+        labelStyle={"display": "flex", "alignItems": "center",
+                    "marginBottom": "3px", "cursor": "pointer"},
+        inputStyle={"marginRight": "6px"},
+    )
+    return html.Div([select_all, checklist])
+
+
 def _legend_section():
+    """Legend for zones and vessel types, in the sidebar."""
     zone_rows = [_legend_swatch(z["line_color"], z["label"], shape="square")
                  for z in ZONES.values()]
-    type_rows = [_legend_swatch(TYPE_COLORS.get(t, DEFAULT_COLOR), t.capitalize(), shape="circle")
-                 for t in VESSEL_TYPES]
     return _sidebar_section("Legend", [
         _legend_subtitle("Zones"),
         *zone_rows,
-        _legend_subtitle("Vessel types"),
-        *type_rows,
     ])
-
 
 def layout():
     return html.Div([
         dcc.Store(id="map-store-filtered-df", data=None),
+        dcc.Store(id="map-sidebar-open", data=True),
         dcc.Download(id="map-download-csv"),
 
         # ── Sidebar: spans the FULL height of the side (map + table included) ──
         html.Div([
 
-            _legend_section(),
 
             _sidebar_section("Precomputed data", [
                 lbl("Jump to a year (optional)"),
                 dcc.Dropdown(id="map-year", value=None, clearable=True,
                     options=[{"label": str(y), "value": y} for y in YEARS],
                     placeholder="Jump to a year...",
-                    style={"color": "#000", "marginBottom": "0.6rem"}),
+                    style={"color": "#000", "marginBottom": "0.8rem"}),
+
                 lbl("Start date"),
                 dcc.DatePickerSingle(id="map-start", date=date(YEARS[-1], 1, 1),
                     display_format="YYYY-MM-DD",
@@ -131,15 +165,16 @@ def layout():
                 html.P("The range can span across two years (e.g. Dec 2024 -> Jan 2025).",
                        style={"fontSize": "0.68rem", "color": DIM, "fontStyle": "italic",
                               "marginBottom": "0.6rem"}),
+
                 lbl("Country (flag)"),
                 dcc.Dropdown(id="map-flag", options=FLAG_OPTIONS, value=[], multi=True,
                     placeholder="All countries...",
                     style={"color": "#000", "marginBottom": "0.6rem"}),
-                lbl("Vessel type"),
+
                 dcc.Dropdown(id="map-vtype",
                     options=[{"label": t.capitalize(), "value": t} for t in VESSEL_TYPES],
-                    value=[], multi=True, placeholder="All types...",
-                    style={"color": "#000", "marginBottom": "0.8rem"}),
+                    value=[], multi=True,
+                    style={"display": "none"}),
                 dcc.Checklist(
                     id="map-show-all-paths",
                     options=[{"label": " Show all trajectories (can be slow on a large selection)",
@@ -147,6 +182,10 @@ def layout():
                     value=[],
                     style={"fontSize": "0.72rem", "color": SOFT, "marginBottom": "0.8rem"},
                 ),
+
+                lbl("Vessel types (tick to show)"),
+                html.Div(_vessel_type_checklist(), style={"marginBottom": "0.8rem"}),
+
                 html.Button("Show", id="map-btn-show", n_clicks=0,
                     style={"width": "100%", "padding": "0.5rem",
                            "background": f"linear-gradient(135deg,{ACC},#0d4a7a)",
@@ -180,21 +219,37 @@ def layout():
                          style={"fontSize": "0.72rem", "color": SOFT}),
             ]),
 
+            _legend_section(),
+
             html.Div(id="map-stats", style={"fontSize": "0.75rem", "color": SOFT}),
 
-            html.Button("Export selection as CSV", id="map-btn-export", n_clicks=0,
-                style={"width": "100%", "padding": "0.5rem", "marginTop": "0.8rem",
-                       "background": PANEL, "color": SOFT,
-                       "border": f"1px solid {BDR}",
-                       "borderRadius": "6px", "cursor": "pointer"}),
 
-        ], style={"width": "260px", "minWidth": "260px", "padding": "1rem",
+
+        ], id="map-sidebar", style={"width": "260px", "minWidth": "260px", "padding": "1rem",
                    "background": BG, "borderRight": f"1px solid {BDR}",
                    "height": "calc(100vh - 52px)", "overflowY": "auto",
                    "flexShrink": "0"}),
 
-        # ── Right column: map (fills the space) + table (fixed strip) ──
+        html.Button("‹", id="map-toggle-sidebar", n_clicks=0, title="Show/hide panel",
+            style={"width": "22px", "minWidth": "22px", "border": "none",
+                   "background": PANEL, "color": MAIN, "cursor": "pointer",
+                   "fontSize": "1.1rem", "fontWeight": "700",
+                   "borderRight": f"1px solid {BDR}", "flexShrink": "0"}),
+
+        # ── Right column: map fills the space; Export button top-right ──
         html.Div([
+            html.Div(
+                html.Button("Export CSV", id="map-btn-export", n_clicks=0,
+                    style={"border": "none",
+                           "background": f"linear-gradient(135deg,{ACC},#0d4a7a)",
+                           "color": "white", "cursor": "pointer", "fontSize": "0.75rem",
+                           "fontWeight": "600",
+                           "padding": "0.3rem 1rem", "borderRadius": "5px"}),
+                style={"padding": "0.3rem 0.6rem", "background": BG,
+                       "borderBottom": f"1px solid {BDR}", "flexShrink": "0",
+                       "display": "flex", "justifyContent": "flex-end"},
+            ),
+
             html.Div([
                 dcc.Loading(
                     type="circle", color=ACC,
@@ -204,16 +259,7 @@ def layout():
                 ),
             ], style={"flex": "1", "minHeight": 0, "position": "relative"}),
 
-            html.Div(
-                dcc.Loading(
-                    parent_style={"height": "100%", "width": "100%"},
-                    style={"height": "100%", "width": "100%"},
-                    children=html.Div(id="map-vessel-list"),
-                ),
-                style={"height": "220px", "flexShrink": "0", "overflowY": "auto",
-                       "borderTop": f"1px solid {BDR}", "padding": "0.5rem 1rem",
-                       "background": BG},
-            ),
+            html.Div(id="map-vessel-list", style={"display": "none"}),
         ], style={"flex": "1", "minHeight": 0, "display": "flex", "flexDirection": "column"}),
 
     ], style={"display": "flex", "height": "calc(100vh - 52px)"})
@@ -333,20 +379,63 @@ def _build_map(df, show_all_paths=False):
 
 def register_callbacks(app):
 
+    # Sync the "Select / deselect all" master checkbox with the type list.
+    # Bidirectional: clicking the master toggles every type; ticking the
+    # individual boxes updates whether the master appears checked.
+    @app.callback(
+        Output("map-type-filter", "value"),
+        Output("map-type-select-all", "value"),
+        Input("map-type-select-all", "value"),
+        Input("map-type-filter", "value"),
+    )
+    def _sync_select_all(master, selected):
+        trigger = (dash.callback_context.triggered_id
+                   if dash.callback_context.triggered else None)
+        if trigger == "map-type-select-all":
+            if "all" in (master or []):
+                return list(VESSEL_TYPES), ["all"]
+            return [], []
+        master_val = ["all"] if set(selected or []) == set(VESSEL_TYPES) else []
+        return selected, master_val
+    @app.callback(
+        Output("map-type-filter", "value"),
+        Output("map-type-select-all", "children"),
+        Input("map-type-select-all", "n_clicks"),
+        State("map-type-filter", "value"),
+        prevent_initial_call=True,
+    )
+    def _toggle_all_types(n, selected):
+        # If anything is selected, clear it; otherwise select everything.
+        if selected:
+            return [], "Select all"
+        return list(VESSEL_TYPES), "Deselect all"
     # "Jump to a year" is just a convenience: it fills in Jan 1 -> Dec 31
     # of the chosen year, but doesn't restrict the pickers -- the user is
     # still free to edit either date afterwards, including across a year
     # boundary (e.g. change the end date to the following January).
     @app.callback(
-        Output("map-start", "date"),
-        Output("map-end", "date"),
-        Input("map-year", "value"),
+        Output("map-sidebar", "style"),
+        Output("map-toggle-sidebar", "children"),
+        Output("map-sidebar-open", "data"),
+        Input("map-toggle-sidebar", "n_clicks"),
+        State("map-sidebar-open", "data"),
         prevent_initial_call=True,
     )
-    def jump_to_year(year):
-        if not year:
-            raise dash.exceptions.PreventUpdate
-        return date(year, 1, 1), date(year, 12, 31)
+    def _toggle_sidebar(n, is_open):
+        now_open = not is_open
+        if now_open:
+            style = {"width": "260px", "minWidth": "260px", "padding": "1rem",
+                     "background": BG, "borderRight": f"1px solid {BDR}",
+                     "height": "calc(100vh - 52px)", "overflowY": "auto",
+                     "flexShrink": "0"}
+            arrow = "‹"
+        else:
+            style = {"width": "0px", "minWidth": "0px", "padding": "0",
+                     "background": BG, "borderRight": f"1px solid {BDR}",
+                     "height": "calc(100vh - 52px)", "overflow": "hidden",
+                     "flexShrink": "0"}
+            arrow = "›"
+        return style, arrow, now_open
 
     @app.callback(
         Output("map-container", "children"),
@@ -363,9 +452,11 @@ def register_callbacks(app):
         State("map-gear", "value"),
         State("map-show-all-paths", "value"),
         State("map-csv-selector", "value"),
+        State("map-type-filter", "value"),
         prevent_initial_call=False,
     )
-    def update_map(n1, n2, start, end, flags, vtypes, gear, show_all, csv_path):
+    def update_map(n1, n2, start, end, flags, vtypes, gear, show_all, csv_path,
+                   type_filter):
         trigger = dash.callback_context.triggered_id if dash.callback_context.triggered else None
         show_all_paths = "all" in (show_all or [])
 
@@ -400,7 +491,11 @@ def register_callbacks(app):
         if pd.to_datetime(start) > pd.to_datetime(end):
             start, end = end, start
 
-        df = load_trajectories_range(start, end, vtypes or None, flags or None)
+        df = load_trajectories_range(start, end, vtypes or None, flags or None, columns=TRAJECTORY_COLUMNS)
+        #Filter by vessel type if the column exists (precomputed trajectories have it, but imported CSVs may not)
+        if type_filter is not None and "vessel_type" in df.columns:
+            df = df[df["vessel_type"].astype(str).str.upper().isin(
+                [t.upper() for t in type_filter])]
         df = _apply_gear_filter(df, gear)
         map_c, note = _build_map(df, show_all_paths)
         if df.empty:
@@ -424,5 +519,13 @@ def register_callbacks(app):
     def export_csv(n, has_data):
         if not has_data or _LAST_FILTERED_DF["df"] is None or _LAST_FILTERED_DF["df"].empty:
             return dash.no_update
-        df = _LAST_FILTERED_DF["df"]
+        df = _LAST_FILTERED_DF["df"].copy()
+        if "gear_type" not in df.columns:
+            df["gear_type"] = ""
+        cols = list(df.columns)
+        if "gear_type" in cols and "vessel_type" in cols:
+            cols.remove("gear_type")
+            idx = cols.index("vessel_type") + 1
+            cols.insert(idx, "gear_type")
+            df = df[cols]
         return dcc.send_data_frame(df.to_csv, "selection_trajectories.csv", index=False)

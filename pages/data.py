@@ -2,99 +2,151 @@
 pages/data.py
 =============
 "Data" page: download from Global Fishing Watch.
-No gear_type filter, no selector for existing CSVs here (moved to the
-other pages, where each user picks their own file).
+
+Deux colonnes cote a cote :
+  - GAUCHE : Vessel Presence (VP) -- presence AIS (comportement existant)
+  - DROITE : Apparent Fishing Effort (AFE) -- effort de peche
+
+La cle API vient de get_api_key() (saisie une fois via la pop-up), il n'y a
+plus de champ cle sur cette page.
 """
 
 import asyncio
 import threading
 from datetime import date
 from pathlib import Path
+import tempfile, os
 
+from api_key import get_api_key
 import dash
 import pandas as pd
 from dash import dcc, html, Input, Output, State
 
 from shared import BG, PANEL, BDR, DIM, MAIN, SOFT, ACC, lbl, card, GFW_DOWNLOAD_DIR
 from config import FLAG_NAMES
-from gfw import get_gfw_client, bulk_load_data_to_csv, test_api_key, GFW_VESSEL_TYPES, COUNTRY_FLAGS
+from gfw import (get_gfw_client, bulk_load_data_to_csv, bulk_load_afe_to_csv,
+                GFW_VESSEL_TYPES, COUNTRY_FLAGS)
+
+async def load_AFE_data(flags, start, end, client, max_retries=10):
+    """
+    Télécharge l'effort de pêche apparent (AFE) pour un ou plusieurs pavillons,
+    sur la région Égée élargie. Ne garde que les navires de pêche.
+    Même gestion des 429 (rate limit) que load_VP_data.
+    """
+    region_geometry = mapping(_AFE_REGION_POLY)
+
+    if isinstance(flags, list):
+        flag_filter = "flag IN (" + ", ".join(["'{}'".format(f) for f in flags]) + ")"
+    else:
+        flag_filter = f"flag = '{flags}'"
+
+    api_filters = [flag_filter, "distance_from_port_km > 3"]
+
+    import asyncio
+    for attempt in range(max_retries):
+        try:
+            report = await client.fourwings.create_fishing_effort_report(
+                spatial_resolution="HIGH",
+                temporal_resolution="HOURLY",
+                group_by="VESSEL_ID",
+                filters=api_filters,
+                start_date=start,
+                end_date=end,
+                geojson=region_geometry,
+            )
+            break
+        except Exception as e:
+            msg = str(e)
+            is_rate_limit = ("429" in msg or "Too Many Requests" in msg
+                             or "concurrent report" in msg)
+            if is_rate_limit and attempt < max_retries - 1:
+                await asyncio.sleep(min(2 ** attempt, 30))
+                continue
+            raise
+
+    df = report.df()
+    if df.empty:
+        return df
+    if "vessel_type" in df.columns:
+        df = df[df["vessel_type"] == "FISHING"]
+    return df
+
+def _download_panel(prefix, title, subtitle, show_vtypes=True):
+    """prefix = 'vp' ou 'afe' -> sert à préfixer tous les id du panneau."""
+    children = [
+        html.H6(title, style={"color": MAIN, "marginBottom": "0.2rem"}),
+        html.P(subtitle, style={"color": DIM, "fontSize": "0.75rem", "marginBottom": "1rem"}),
+
+        html.Div([
+            html.Div([
+                lbl("Start date"),
+                dcc.DatePickerSingle(id=f"{prefix}-start", date=date(2026, 1, 1),
+                    display_format="YYYY-MM-DD",
+                    min_date_allowed=date(2012, 1, 1), max_date_allowed=date(2026, 12, 31)),
+            ], style={"marginRight": "1.5rem"}),
+            html.Div([
+                lbl("End date"),
+                dcc.DatePickerSingle(id=f"{prefix}-end", date=date(2026, 1, 31),
+                    display_format="YYYY-MM-DD",
+                    min_date_allowed=date(2012, 1, 1), max_date_allowed=date(2026, 12, 31)),
+            ]),
+        ], style={"display": "flex", "marginBottom": "1rem"}),
+
+        lbl("Country / Flag"),
+        dcc.Dropdown(id=f"{prefix}-flags",
+            options=[{"label": "ALL countries", "value": "ALL"}] +
+                    [{"label": f"{FLAG_NAMES.get(f, f)} ({f})", "value": f}
+                     for f in COUNTRY_FLAGS],
+            value=["GRC"], multi=True, placeholder="Select countries...",
+            style={"color": "#000", "marginBottom": "1rem"}),
+    ]
+
+    if show_vtypes:
+        children += [
+            lbl("Vessel type (leave empty for ALL)"),
+            dcc.Dropdown(id=f"{prefix}-vtypes",
+                options=[{"label": t.capitalize(), "value": t} for t in GFW_VESSEL_TYPES],
+                value=[], multi=True, placeholder="All types...",
+                style={"color": "#000", "marginBottom": "1.2rem"}),
+        ]
+    else:
+        children += [dcc.Store(id=f"{prefix}-vtypes", data=[])]
+
+    children += [
+        html.Div([
+            html.Button(f"Download {title}", id=f"{prefix}-btn", n_clicks=0,
+                style={"padding": "0.6rem 1.4rem",
+                       "background": f"linear-gradient(135deg,{ACC},#0d4a7a)",
+                       "color": "white", "border": "none", "borderRadius": "6px",
+                       "cursor": "pointer", "fontWeight": "600", "marginRight": "1rem"}),
+            dcc.Loading(id=f"{prefix}-loading", type="circle", color=ACC,
+                style={"display": "inline-block"},
+                children=html.Span(id=f"{prefix}-status",
+                    style={"fontSize": "0.76rem", "color": SOFT, "fontStyle": "italic"})),
+        ], style={"display": "flex", "alignItems": "center"}),
+    ]
+
+    return html.Div(card(children),
+                    style={"flex": "1", "minWidth": "340px"})
 
 
+# LAYOUT — deux colonnes
 def layout():
     return html.Div([
+        dcc.Download(id="vp-file-download"),
+        dcc.Download(id="afe-file-download"),
 
         html.H5("Download from Global Fishing Watch",
                 style={"color": MAIN, "marginBottom": "0.3rem"}),
-        html.P("Enter your API key, select filters, then click Download.",
+        html.P("Select filters, then click Download. Your API key is asked once.",
                style={"color": DIM, "fontSize": "0.8rem", "marginBottom": "1.2rem"}),
 
-        card([
-            lbl("GFW API Key"),
-            # No stored/prefilled value here on purpose: this app is shared
-            # between multiple users, so each person enters their own key.
-            dcc.Input(id="data-gfw-key", type="password",
-                      placeholder="Paste your GFW API key...",
-                      style={"width": "100%", "padding": "0.5rem", "background": BG,
-                             "color": MAIN, "border": f"1px solid {BDR}",
-                             "borderRadius": "6px", "marginBottom": "0.3rem",
-                             "fontFamily": "monospace"}),
-            html.Div(id="data-key-status", style={"fontSize": "0.7rem", "minHeight": "1rem",
-                                                    "marginBottom": "0.8rem"}),
-
-            html.Div([
-                html.Div([
-                    lbl("Start date"),
-                    dcc.DatePickerSingle(id="data-gfw-start", date=date(2024, 7, 1),
-                        display_format="YYYY-MM-DD",
-                        min_date_allowed=date(2012, 1, 1),
-                        max_date_allowed=date(2026, 12, 31)),
-                ], style={"marginRight": "2rem"}),
-                html.Div([
-                    lbl("End date"),
-                    dcc.DatePickerSingle(id="data-gfw-end", date=date(2024, 7, 31),
-                        display_format="YYYY-MM-DD",
-                        min_date_allowed=date(2012, 1, 1),
-                        max_date_allowed=date(2026, 12, 31)),
-                ]),
-            ], style={"display": "flex", "marginBottom": "1rem"}),
-
-            html.Div([
-                html.Div([
-                    lbl("Country / Flag"),
-                    dcc.Dropdown(id="data-gfw-flags",
-                        options=[{"label": "ALL countries", "value": "ALL"}] +
-                                [{"label": f"{FLAG_NAMES.get(f, f)} ({f})", "value": f}
-                                 for f in COUNTRY_FLAGS],
-                        value=["GRC"], multi=True, placeholder="Select countries...",
-                        style={"width": "300px", "color": "#000"}),
-                ], style={"marginRight": "1.5rem"}),
-                html.Div([
-                    lbl("Vessel type (leave empty for ALL)"),
-                    dcc.Dropdown(id="data-gfw-vtypes",
-                        options=[{"label": t.capitalize(), "value": t}
-                                 for t in GFW_VESSEL_TYPES],
-                        value=[], multi=True, placeholder="All types...",
-                        style={"width": "300px", "color": "#000"}),
-                ]),
-            ], style={"display": "flex", "flexWrap": "wrap", "marginBottom": "1.2rem"}),
-
-            html.Div([
-                html.Button("Download from GFW", id="data-btn-download", n_clicks=0,
-                    style={"padding": "0.6rem 1.5rem", "background": f"linear-gradient(135deg,{ACC},#0d4a7a)",
-                           "color": "white", "border": "none", "borderRadius": "6px",
-                           "cursor": "pointer", "fontWeight": "600", "marginRight": "1rem"}),
-                # dcc.Loading shows a spinner around the status text for as
-                # long as the do_download callback below is running.
-                dcc.Loading(
-                    id="data-download-loading",
-                    type="circle",
-                    color=ACC,
-                    style={"display": "inline-block"},
-                    children=html.Span(id="data-download-status",
-                              style={"fontSize": "0.78rem", "color": SOFT, "fontStyle": "italic"}),
-                ),
-            ], style={"display": "flex", "alignItems": "center"}),
-        ]),
+        html.Div([
+            _download_panel("vp", "Vessel Presence",
+                            "AIS presence of vessels (positions).", show_vtypes=True),
+            _download_panel("afe", "Fishing Effort (AFE)",
+                            "Apparent fishing effort (fishing vessels only).", show_vtypes=False),
+        ], style={"display": "flex", "gap": "1.5rem", "flexWrap": "wrap"}),
 
         html.Div(id="data-active-dataset",
                  style={"marginTop": "1rem", "padding": "0.6rem 1rem",
@@ -105,108 +157,128 @@ def layout():
     ], style={"padding": "1.5rem", "background": BG, "minHeight": "calc(100vh - 52px)"})
 
 
+# Logique of download (VP or AFE) is in _do_download() below, called by the callbacks.
+def _do_download(kind, start, end, flags, vtypes):
+    """kind = 'VP' ou 'AFE'. Renvoie (message, csv_path_or_none, info)."""
+    key = get_api_key()
+    if not key:
+        return "No API key saved.", None, None
+
+    ds, de = start[:10], end[:10]
+    if flags and "ALL" in flags:
+        resolved_flags = COUNTRY_FLAGS
+    else:
+        resolved_flags = flags or None
+
+    flag_tag = "_".join((resolved_flags or ["ALL"])[:2])
+    fname = f"{kind}_{flag_tag}_{ds}_{de}.csv"
+    csv_path = os.path.join(tempfile.gettempdir(), fname)
+
+    result = {"rows": 0, "error": None}
+
+    def _run():
+        try:
+            client = get_gfw_client(key)
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            if kind == "VP":
+                total_rows, _, _ = loop.run_until_complete(
+                    bulk_load_data_to_csv(resolved_flags, vtypes or None, ds, de, client, csv_path))
+            else:  # AFE
+                loop.run_until_complete(
+                    bulk_load_afe_to_csv(resolved_flags, ds, de, client, csv_path))
+                try:
+                    total_rows = sum(1 for _ in open(csv_path, encoding="utf-8")) - 1
+                except Exception:
+                    total_rows = 0
+            loop.close()
+
+            if total_rows and total_rows > 0:
+                result["rows"] = total_rows
+                result["path"] = csv_path
+                result["fname"] = fname
+            else:
+                result["error"] = "No data returned. Try different filters or dates."
+                p = Path(csv_path)
+                if p.exists():
+                    p.unlink()
+        except Exception as e:
+            result["error"] = str(e)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join()
+
+    if result.get("error"):
+        return f"Error: {result['error']}", None, None
+
+    msg = f"Download complete: {result['rows']:,} records saved."
+    info = f"Active dataset: {result['fname']} ({result['rows']:,} rows) — {result['path']}"
+    return msg, result["path"], info
+
+
+# CALLBACKS
 def register_callbacks(app):
 
+    # Instant feedback on click (VP and AFE)
+    for prefix in ("vp", "afe"):
+        app.clientside_callback(
+            """
+            function(n) {
+                if (!n) { return window.dash_clientside.no_update; }
+                return "Download in progress...";
+            }
+            """,
+            Output(f"{prefix}-status", "children", allow_duplicate=True),
+            Input(f"{prefix}-btn", "n_clicks"),
+            prevent_initial_call=True,
+        )
+
+    # Download VP
     @app.callback(
-        Output("data-key-status", "children"),
-        Output("data-key-status", "style"),
-        Input("data-gfw-key", "value"),
+        Output("vp-status", "children", allow_duplicate=True),
+        Output("store-csv-path", "data", allow_duplicate=True),
+        Output("data-active-dataset", "children", allow_duplicate=True),
+        Output("vp-file-download", "data"),
+        Input("vp-btn", "n_clicks"),
+        State("vp-start", "date"), State("vp-end", "date"),
+        State("vp-flags", "value"), State("vp-vtypes", "value"),
         prevent_initial_call=True,
     )
-    def validate_key(key):
-        if not key or len(key) < 10:
-            return "", {}
-        valid, msg = test_api_key(key)
-        color = "#32cd32" if valid else "#ff6b6b"
-        return msg, {"fontSize": "0.7rem", "color": color}
+    def _dl_vp(n, start, end, flags, vtypes):
+        if not n:
+            raise dash.exceptions.PreventUpdate
+        msg, path, info = _do_download("VP", start, end, flags, vtypes)
+        if path is None:
+            return msg, dash.no_update, dash.no_update, dash.no_update
+        # lit le fichier en mémoire, l'envoie au navigateur, puis nettoie le disque
+        send = dcc.send_file(path)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return msg, dash.no_update, dash.no_update, send
 
-    # Clientside callback: runs instantly in the browser on click, before
-    # the (potentially long) download even starts on the server side.
-    # Gives the user immediate feedback that something is happening.
-    app.clientside_callback(
-        """
-        function(n_clicks) {
-            if (!n_clicks) { return window.dash_clientside.no_update; }
-            return "Download in progress...";
-        }
-        """,
-        Output("data-download-status", "children", allow_duplicate=True),
-        Input("data-btn-download", "n_clicks"),
-        prevent_initial_call=True,
-    )
-
+    # Download AFE
     @app.callback(
-        Output("data-download-status", "children", allow_duplicate=True),
-        Output("store-csv-path", "data"),
-        Output("store-df", "data"),
-        Output("data-active-dataset", "children"),
-        Input("data-btn-download", "n_clicks"),
-        State("data-gfw-key", "value"),
-        State("data-gfw-start", "date"),
-        State("data-gfw-end", "date"),
-        State("data-gfw-flags", "value"),
-        State("data-gfw-vtypes", "value"),
+        Output("afe-status", "children", allow_duplicate=True),
+        Output("store-csv-path", "data", allow_duplicate=True),
+        Output("data-active-dataset", "children", allow_duplicate=True),
+        Output("afe-file-download", "data"),
+        Input("afe-btn", "n_clicks"),
+        State("afe-start", "date"), State("afe-end", "date"),
+        State("afe-flags", "value"), State("afe-vtypes", "data"),
         prevent_initial_call=True,
     )
-    def do_download(n, key, start, end, flags, vtypes):
-        if not key:
-            return "Please enter your API key.", dash.no_update, dash.no_update, dash.no_update
-        if not start or not end:
-            return "Please select dates.", dash.no_update, dash.no_update, dash.no_update
-
-        ds = start[:10]
-        de = end[:10]
-
-        if flags and "ALL" in flags:
-            resolved_flags = COUNTRY_FLAGS
-        else:
-            resolved_flags = flags or None
-
-        # The filename is decided BEFORE the download starts (data is
-        # streamed straight to disk), so it's based on the requested dates,
-        # not the actual dates of the data (only known afterwards).
-        flag_tag = "_".join((resolved_flags or ["ALL"])[:2])
-        fname = f"VP_{flag_tag}_{ds}_{de}.csv"
-        csv_path = str(GFW_DOWNLOAD_DIR / fname)
-
-        result = {"rows": 0, "error": None}
-
-        def _run():
-            try:
-                client = get_gfw_client(key)
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                total_rows, actual_start, actual_end = loop.run_until_complete(
-                    bulk_load_data_to_csv(resolved_flags, vtypes or None, ds, de, client, csv_path)
-                )
-                loop.close()
-                if total_rows > 0:
-                    result["rows"] = total_rows
-                    result["path"] = csv_path
-                    result["fname"] = fname
-                else:
-                    result["error"] = "No data returned. Try different filters or dates."
-                    # The file may have been created empty (header only) or
-                    # not at all -- clean it up either way.
-                    p = Path(csv_path)
-                    if p.exists():
-                        p.unlink()
-            except Exception as e:
-                result["error"] = str(e)
-
-        t = threading.Thread(target=_run, daemon=True)
-        t.start()
-        t.join()
-
-        if result.get("error"):
-            return f"Error: {result['error']}", dash.no_update, dash.no_update, dash.no_update
-
-        # Success message tells the user how many rows were downloaded and
-        # the exact path of the file on disk.
-        msg = f"Download complete: {result['rows']:,} records saved to {result['path']}"
-        info = f"Active dataset: {result['fname']} ({result['rows']:,} rows) — {result['path']}"
-        # NOTE: we no longer send the full dataframe as JSON to the browser
-        # (store-df) -- nothing consumed it, and it was tens of MB wasted on
-        # every download. The other pages reload the CSV directly from disk
-        # through their own file selector.
-        return msg, result["path"], True, info
+    def _dl_afe(n, start, end, flags, vtypes):
+        if not n:
+            raise dash.exceptions.PreventUpdate
+        msg, path, info = _do_download("AFE", start, end, flags, vtypes)
+        if path is None:
+            return msg, dash.no_update, dash.no_update, dash.no_update
+        send = dcc.send_file(path)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return msg, dash.no_update, dash.no_update, send

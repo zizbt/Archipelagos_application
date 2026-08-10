@@ -20,77 +20,81 @@ from config import YEARS, VESSEL_TYPES, SEASON_ORDER, ROOT
 from loader import load_heatmap
 from gfw import list_downloaded_csvs, load_csv
 
+HEATMAP_COLUMNS = ["lat", "lon"]
+
 
 def layout():
     return html.Div([
         dcc.Store(id="hm-store-csv-df", data=None),
 
-        # Barre de contrôle
+        # Barre de contrôle unique (tout sur une ligne)
         html.Div([
             html.Div([lbl("Année"),
                 dcc.Dropdown(id="hm-year", value=YEARS[-1], clearable=False,
                     options=[{"label": str(y), "value": y} for y in YEARS],
                     style={"width": "100px", "color": "#000"})],
                 style={"marginRight": "1.2rem"}),
+
             html.Div([lbl("Type de bateau"),
                 dcc.Dropdown(id="hm-vtype", value=[], multi=True,
                     placeholder="Tous...",
                     options=[{"label": t.capitalize(), "value": t} for t in VESSEL_TYPES],
                     style={"width": "220px", "color": "#000"})],
                 style={"marginRight": "1.2rem"}),
+
             html.Div([lbl(" "),
                 html.Button("Afficher", id="hm-btn-show", n_clicks=0,
                     style={"padding": "0.45rem 1.2rem",
                            "background": f"linear-gradient(135deg,{ACC},#0d4a7a)",
                            "color": "white", "border": "none",
                            "borderRadius": "6px", "cursor": "pointer",
-                           "fontWeight": "600"})]),
+                           "fontWeight": "600"})],
+                style={"marginRight": "2rem"}),
+
+            html.Div([lbl("Import a downloaded CSV"),
+                dcc.Dropdown(id="hm-csv-selector",
+                    options=[{"label": f["filename"], "value": f["path"]}
+                             for f in list_downloaded_csvs(ROOT / "data")],
+                    value=None, placeholder="Choose a CSV...",
+                    style={"width": "320px", "color": "#000"})],
+                style={"marginRight": "1rem"}),
+
+            html.Div([lbl(" "),
+                html.Button("Heatmap of this CSV", id="hm-btn-show-csv", n_clicks=0,
+                    style={"padding": "0.45rem 1.2rem", "background": PANEL,
+                           "color": SOFT, "border": f"1px solid {BDR}",
+                           "borderRadius": "6px", "cursor": "pointer"})]),
+
             html.Div(id="hm-info",
                      style={"fontSize": "0.7rem", "color": DIM,
                             "marginLeft": "1rem", "alignSelf": "flex-end",
                             "paddingBottom": "2px"}),
-        ], style={"display": "flex", "alignItems": "flex-end", "gap": "0.5rem",
-                   "padding": "0.8rem 1.2rem", "background": BG,
-                   "borderBottom": f"1px solid {BDR}", "flexWrap": "wrap"}),
-
-        # Import CSV personnel
-        html.Div([
-            html.Div([lbl("Importer un CSV téléchargé"),
-                dcc.Dropdown(id="hm-csv-selector",
-                    options=[{"label": f["filename"], "value": f["path"]}
-                             for f in list_downloaded_csvs(ROOT / "data")],
-                    value=None, placeholder="Choisir un CSV...",
-                    style={"width": "320px", "color": "#000"})],
-                style={"marginRight": "1rem"}),
-            html.Div([lbl(" "),
-                html.Button("Heatmap de ce CSV", id="hm-btn-show-csv", n_clicks=0,
-                    style={"padding": "0.45rem 1.2rem", "background": PANEL,
-                           "color": SOFT, "border": f"1px solid {BDR}",
-                           "borderRadius": "6px", "cursor": "pointer"})]),
             html.Div(id="hm-csv-status",
                      style={"fontSize": "0.72rem", "color": SOFT,
-                            "marginLeft": "1rem", "alignSelf": "flex-end", "paddingBottom": "6px"}),
+                            "marginLeft": "1rem", "alignSelf": "flex-end",
+                            "paddingBottom": "6px"}),
+
         ], style={"display": "flex", "alignItems": "flex-end", "gap": "0.5rem",
-                   "padding": "0.6rem 1.2rem", "background": BG,
+                   "padding": "0.8rem 1.2rem", "background": BG,
                    "borderBottom": f"1px solid {BDR}", "flexWrap": "wrap"}),
 
         # Grille des heatmaps (4 saisons OU CSV importé)
         html.Div(
             dcc.Loading(type="circle", color=ACC,
                 children=html.Div(id="hm-container",
-                    style={"height": "calc(100vh - 52px - 140px)", "width": "100%"})),
+                    style={"height": "calc(100vh - 52px - 90px)", "width": "100%"})),
             style={"flex": "1", "minHeight": 0}),
 
     ], style={"display": "flex", "flexDirection": "column",
               "height": "calc(100vh - 52px)", "background": BG})
 
-
+              
 def _season_deck(year, season_name, vtypes):
     if vtypes:
-        frames = [load_heatmap(year, season_name, t) for t in vtypes]
+        frames = [load_heatmap(year, season_name, t, columns=HEATMAP_COLUMNS) for t in vtypes]
         df = pd.concat([f for f in frames if not f.empty], ignore_index=True) if frames else pd.DataFrame()
     else:
-        df = load_heatmap(year, season_name, None)
+        df = load_heatmap(year, season_name, None, columns=HEATMAP_COLUMNS)
     n_pts = len(df)
     if df.empty:
         df = pd.DataFrame({"lat": [37.5], "lon": [24.5]})

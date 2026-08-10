@@ -1,16 +1,12 @@
 """
 pages/ports.py
 ==============
-Page "Port visits" -- recupere les visites de ports via l'API GFW
-(dataset public-global-port-visits-events:latest) pour les navires
-presents dans un CSV telecharge, puis agrege par port.
+Page "Port visits" -- takes a downloaded CSV (with vessel_id) and calls the GFW API to retrieve port visits.
 
 Workflow :
-- L'utilisateur choisit un CSV deja telecharge (page Data) + saisit sa cle API.
-- On extrait les vessel_id uniques du CSV.
-- On appelle GFW PORT_VISIT sur ces navires (logique reprise de Port_visits.py).
-- On agrege par port : taille du point = nombre de visites.
-- Table detaillee (avec confidence) + export CSV.
+- The user downloads a CSV from the "Data" page (or any other source with vessel_id)
+- The user selects the CSV, start/end dates, and clicks "Fetch port visits"
+- The app calls the GFW API to retrieve port visits for the vessels in the CSV
 
 L'appel API peut etre long (reseau + pagination) : dcc.Loading affiche
 un spinner pendant le traitement.
@@ -29,6 +25,7 @@ from dash import dcc, html, Input, Output, State, dash_table
 from shared import BG, PANEL, BDR, DIM, MAIN, SOFT, ACC, MAPBOX_KEY, lbl, AEGEAN_CENTER
 from config import YEARS, ROOT, FLAG_NAMES
 from gfw import get_gfw_client, list_downloaded_csvs, load_csv
+from api_key import get_api_key
 
 GLOBAL_MIN_DATE = date(YEARS[0], 1, 1)
 GLOBAL_MAX_DATE = date(YEARS[-1], 12, 31)
@@ -36,9 +33,7 @@ GLOBAL_MAX_DATE = date(YEARS[-1], 12, 31)
 PORT_COLOR = [0, 200, 255, 190]   # cyan
 
 
-# ---------------------------------------------------------------------------
-# APPEL GFW PORT_VISIT (repris a l'identique de Port_visits.py)
-# ---------------------------------------------------------------------------
+# CALL GFW PORT_VISIT
 async def _load_port_visits(vessel_ids, start, end, client):
     if isinstance(vessel_ids, str):
         vessel_ids = [vessel_ids]
@@ -142,9 +137,7 @@ def aggregate_by_port(visits):
     return g.sort_values("n_visits", ascending=False).reset_index(drop=True)
 
 
-# ---------------------------------------------------------------------------
 # LAYOUT
-# ---------------------------------------------------------------------------
 def layout():
     return html.Div([
         dcc.Store(id="port-store", data=None),
@@ -154,11 +147,6 @@ def layout():
             html.H6("Port visits", style={"color": MAIN, "fontSize": "0.82rem", "marginBottom": "0.6rem"}),
             html.P("Fetches GFW port-visit events for the vessels in a downloaded CSV.",
                    style={"fontSize": "0.7rem", "color": DIM, "marginBottom": "1rem"}),
-
-            lbl("GFW API key"),
-            dcc.Input(id="port-api-key", type="password", placeholder="Paste your API key...",
-                style={"width": "100%", "marginBottom": "0.8rem", "color": "#000",
-                       "padding": "0.4rem", "borderRadius": "4px"}),
 
             lbl("Downloaded CSV (vessel source)"),
             dcc.Dropdown(id="port-csv-selector",
@@ -216,9 +204,8 @@ def layout():
     ], style={"display": "flex", "height": "calc(100vh - 52px)"})
 
 
-# ---------------------------------------------------------------------------
+
 # HELPERS carte + table
-# ---------------------------------------------------------------------------
 def _build_map(agg):
     layers = []
     if agg is not None and not agg.empty:
@@ -269,9 +256,7 @@ def _table(agg):
     )
 
 
-# ---------------------------------------------------------------------------
 # CALLBACKS
-# ---------------------------------------------------------------------------
 def register_callbacks(app):
 
     @app.callback(
@@ -281,17 +266,17 @@ def register_callbacks(app):
         Output("port-status", "children"),
         Output("port-store", "data"),
         Input("port-btn-run", "n_clicks"),
-        State("port-api-key", "value"),
         State("port-csv-selector", "value"),
         State("port-start", "date"),
         State("port-end", "date"),
         prevent_initial_call=True,
     )
-    def _run(n, api_key, csv_path, start, end):
+    def _run(n, csv_path, start, end):
         if not n:
             raise dash.exceptions.PreventUpdate
+        api_key = get_api_key()
         if not api_key:
-            return _build_map(None), _table(None), "", "Please enter your GFW API key.", None
+            return _build_map(None), _table(None), "", "No API key saved.", None
         if not csv_path:
             return _build_map(None), _table(None), "", "Please choose a CSV.", None
 

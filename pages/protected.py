@@ -37,6 +37,8 @@ from config import YEARS, VESSEL_TYPES, TYPE_COLORS, DEFAULT_COLOR, FLAG_NAMES, 
 from loader import load_geojson, load_trajectories_range
 from gfw import list_downloaded_csvs, load_csv, GEAR_TYPES
 
+TRAJECTORY_COLUMNS = ["lat", "lon", "vessel_id", "ship_name", "date", "flag", "vessel_type", "gear_type"]
+
 ZONE_KEY = "fourni_protected"
 ZONE_FILL = [255, 215, 0, 60]
 ZONE_LINE = [255, 215, 0, 230]
@@ -141,6 +143,40 @@ def layout():
                 html.P("The range can span across two years (e.g. Dec 2024 -> Jan 2025).",
                        style={"fontSize": "0.68rem", "color": DIM, "fontStyle": "italic",
                               "marginBottom": "0.6rem"}),
+                lbl("Vessel types (tick to show)"),
+                html.Button(
+                    "Deselect all",
+                    id="prot-type-select-all",
+                    n_clicks=0,
+                    style={"fontSize": "0.7rem", "color": SOFT, "background": "none",
+                           "border": f"1px solid {BDR}", "borderRadius": "4px",
+                           "padding": "3px 8px", "marginBottom": "6px", "cursor": "pointer"},
+                ),
+                dcc.Checklist(
+                    id="prot-type-filter",
+                    options=[
+                        {"label": html.Span([
+                            html.Span(style={
+                                "display": "inline-block", "width": "11px", "height": "11px",
+                                "borderRadius": "50%", "marginRight": "7px",
+                                "backgroundColor": "rgba({},{},{},{})".format(
+                                    *(TYPE_COLORS.get(t, DEFAULT_COLOR)[:3]),
+                                    (TYPE_COLORS.get(t, DEFAULT_COLOR)[3] / 255)
+                                    if len(TYPE_COLORS.get(t, DEFAULT_COLOR)) > 3 else 1),
+                                "verticalAlign": "middle"}),
+                            html.Span(t.capitalize(),
+                                    style={"fontSize": "0.72rem", "color": SOFT,
+                                            "verticalAlign": "middle"})],
+                            style={"display": "inline-flex", "alignItems": "center"}),
+                        "value": t}
+                        for t in VESSEL_TYPES
+                    ],
+                    value=list(VESSEL_TYPES),
+                    labelStyle={"display": "flex", "alignItems": "center",
+                                "marginBottom": "3px", "cursor": "pointer"},
+                    inputStyle={"marginRight": "6px"},
+                    style={"marginBottom": "0.8rem"},
+                ),
                 html.Button("Analyze", id="prot-btn-run", n_clicks=0,
                     style={"width": "100%", "padding": "0.5rem",
                            "background": f"linear-gradient(135deg,{ACC},#0d4a7a)",
@@ -179,8 +215,18 @@ def layout():
                    "background": BG, "borderRight": f"1px solid {BDR}",
                    "height": "calc(100vh - 52px)", "overflowY": "auto", "flexShrink": "0"}),
 
-        # ── Map (Fourni zoom) + vessel table ────────────────────────────────
+        # ── Map (Fourni zoom), full height + Export button top-right ────────
         html.Div([
+            html.Div(
+                html.Button("Export CSV", id="prot-btn-export", n_clicks=0,
+                    style={"border": "none",
+                           "background": f"linear-gradient(135deg,{ACC},#0d4a7a)",
+                           "color": "white", "cursor": "pointer", "fontSize": "0.75rem",
+                           "fontWeight": "600", "padding": "0.3rem 1rem", "borderRadius": "5px"}),
+                style={"padding": "0.3rem 0.6rem", "background": BG,
+                       "borderBottom": f"1px solid {BDR}", "flexShrink": "0",
+                       "display": "flex", "justifyContent": "flex-end"},
+            ),
             html.Div([
                 dcc.Loading(
                     type="circle", color=ACC,
@@ -190,11 +236,8 @@ def layout():
                 ),
             ], style={"flex": "1", "minHeight": 0}),
 
-            html.Div(
-                dcc.Loading(children=html.Div(id="prot-vessel-table")),
-                style={"height": "260px", "flexShrink": "0", "overflowY": "auto",
-                       "borderTop": f"1px solid {BDR}", "padding": "0.5rem 1rem", "background": BG},
-            ),
+            # tableau conservé mais caché (les callbacks écrivent encore dedans)
+            html.Div(id="prot-vessel-table", style={"display": "none"}),
         ], style={"flex": "1", "minHeight": 0, "display": "flex", "flexDirection": "column"}),
 
     ], style={"display": "flex", "height": "calc(100vh - 52px)"})
@@ -216,10 +259,13 @@ def _build_zone_map(df_inside):
                 lambda t: TYPE_COLORS.get(t, DEFAULT_COLOR))
         else:
             plot["color"] = [DEFAULT_COLOR] * len(plot)
-        ship = plot["ship_name"].astype(str) if "ship_name" in plot.columns else "?"
-        flag_lbl = plot["flag"].map(lambda f: FLAG_NAMES.get(f, f)) if "flag" in plot.columns else "?"
-        vtype = plot["vessel_type"].astype(str) if "vessel_type" in plot.columns else "?"
-        plot["tooltip"] = ship + " (" + flag_lbl.astype(str) + ") - " + vtype.astype(str)
+        plot["t_ship"] = plot["ship_name"].astype(str) if "ship_name" in plot.columns else "?"
+        plot["t_flag"] = (plot["flag"].map(lambda f: FLAG_NAMES.get(f, f)).astype(str)
+                          if "flag" in plot.columns else "?")
+        plot["t_type"] = plot["vessel_type"].astype(str) if "vessel_type" in plot.columns else "?"
+        plot["t_gear"] = (plot["gear_type"].astype(str).str.replace("_", " ").str.title()
+                          if "gear_type" in plot.columns else "-")
+        plot["t_date"] = plot["date"].astype(str) if "date" in plot.columns else "-"
 
         layers.append(pdk.Layer(
             "ScatterplotLayer", data=plot,
@@ -234,10 +280,47 @@ def _build_zone_map(df_inside):
             latitude=FOURNI_CENTER["lat"], longitude=FOURNI_CENTER["lon"],
             zoom=10.5, pitch=0),
         map_style="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
-        tooltip={"text": "{tooltip}"},
+        tooltip={
+            "html": (
+                "<div style='font-size:12px'>"
+                "<b>{t_ship}</b><br/>"
+                "Flag: {t_flag}<br/>"
+                "Type: {t_type}<br/>"
+                "Gear: {t_gear}<br/>"
+                "Date: {t_date}"
+                "</div>"
+            ),
+            "style": {
+                "backgroundColor": "#0d1b2a",
+                "color": "#e0e6ed",
+                "border": "1px solid #1b3a5b",
+                "borderRadius": "6px",
+                "padding": "8px 10px",
+            },
+        },
     )
     deck_json = json.loads(deck.to_json())
-    return dash_deck.DeckGL(data=deck_json, mapboxKey=MAPBOX_KEY, style={"width": "100%", "height": "100%"})
+    return dash_deck.DeckGL(
+        data=deck_json, mapboxKey=MAPBOX_KEY,
+        tooltip={
+            "html": (
+                "<div style='font-size:12px'>"
+                "<b>{t_ship}</b><br/>"
+                "Flag: {t_flag}<br/>"
+                "Type: {t_type}<br/>"
+                "Gear: {t_gear}<br/>"
+                "Date: {t_date}"
+                "</div>"
+            ),
+            "style": {
+                "backgroundColor": "#0d1b2a",
+                "color": "#e0e6ed",
+                "border": "1px solid #1b3a5b",
+                "borderRadius": "6px",
+                "padding": "8px 10px",
+            },
+        },
+        style={"width": "100%", "height": "100%"})
 
 
 def _vessel_table(agg):
@@ -291,6 +374,19 @@ def _summary(agg, note=None):
 
 
 def register_callbacks(app):
+    # "Deselect all / Select all" button: toggles the whole type list and
+    # flips its own label to match the resulting state.
+    @app.callback(
+        Output("prot-type-filter", "value"),
+        Output("prot-type-select-all", "children"),
+        Input("prot-type-select-all", "n_clicks"),
+        State("prot-type-filter", "value"),
+        prevent_initial_call=True,
+    )
+    def _toggle_all_types(n, selected):
+        if selected:
+            return [], "Select all"
+        return list(VESSEL_TYPES), "Deselect all"
 
     # "Jump to a year" is just a convenience: it fills in Jan 1 -> Dec 31
     # of the chosen year, but doesn't restrict the pickers -- the user can
@@ -311,49 +407,80 @@ def register_callbacks(app):
         Output("prot-vessel-table", "children"),
         Output("prot-summary", "children"),
         Output("prot-csv-status", "children"),
+        Output("prot-store-agg", "data"),
         Input("prot-btn-run", "n_clicks"),
         Input("prot-btn-run-csv", "n_clicks"),
         State("prot-start", "date"),
         State("prot-end", "date"),
         State("prot-csv-selector", "value"),
         State("prot-gear-filter", "value"),
+        State("prot-type-filter", "value"),
         prevent_initial_call=False,
     )
-    def run_analysis(n1, n2, start, end, csv_path, gear_filter):
+    
+    def run_analysis(n1, n2, start, end, csv_path, gear_filter, type_filter):
         trigger = dash.callback_context.triggered_id if dash.callback_context.triggered else None
 
         if _ZONE_POLYGON is None:
             msg = html.P("Zone not found: data/gis/fourni_protected.geojson is missing.",
                           style={"color": "#ff6b6b"})
-            return _build_zone_map(pd.DataFrame()), "", msg, ""
+            return _build_zone_map(pd.DataFrame()), "", msg, "", None
 
         if trigger == "prot-btn-run-csv":
             if not csv_path:
-                return _build_zone_map(pd.DataFrame()), "", "", "Choose a CSV first."
+                return _build_zone_map(pd.DataFrame()), "", "", "Choose a CSV first.", None
             try:
                 df = load_csv(csv_path)
             except Exception as e:
-                return _build_zone_map(pd.DataFrame()), "", "", f"Error: {e}"
+                return _build_zone_map(pd.DataFrame()), "", "", f"Error: {e}", None
 
             df_inside = _filter_points_in_zone(df)
+            # Filter by vessel type if the column exists (precomputed trajectories have it, but imported CSVs may not)
+            if type_filter is not None and "vessel_type" in df_inside.columns:
+                df_inside = df_inside[df_inside["vessel_type"].astype(str).str.upper().isin(
+                    [t.upper() for t in type_filter])]
             if gear_filter and "gear_type" in df_inside.columns:
                 df_inside = df_inside[df_inside["gear_type"].astype(str).str.upper().isin(
                     [g.upper() for g in gear_filter])]
             agg = _aggregate_by_vessel(df_inside)
             note = "Analysis based on the imported CSV (gear_type available)."
             status = f"CSV loaded: {len(df):,} rows -> {len(df_inside):,} positions in the zone"
-            return _build_zone_map(df_inside), _vessel_table(agg), _summary(agg, note), status
+            return _build_zone_map(df_inside), _vessel_table(agg), _summary(agg, note), status, (agg.to_dict("records") if not agg.empty else None)
 
         if not start or not end:
-            return _build_zone_map(pd.DataFrame()), "", "Select a date range.", ""
+            return _build_zone_map(pd.DataFrame()), "", "Select a date range.", "", None
 
         # Be forgiving if the user picks the dates in the "wrong" order.
         if pd.to_datetime(start) > pd.to_datetime(end):
             start, end = end, start
 
-        df = load_trajectories_range(start, end, None, None)
+        df = load_trajectories_range(start, end, None, None, columns=TRAJECTORY_COLUMNS)
         df_inside = _filter_points_in_zone(df)
+        # Filter by vessel type (checkboxes) before aggregating / mapping / exporting
+        if type_filter is not None and "vessel_type" in df_inside.columns:
+            df_inside = df_inside[df_inside["vessel_type"].astype(str).str.upper().isin(
+                [t.upper() for t in type_filter])]
         agg = _aggregate_by_vessel(df_inside)
-        note = ("Based on precomputed trajectories (vessel_type available, "
-                "no gear_type -> import a CSV to isolate Trawlers).")
-        return _build_zone_map(df_inside), _vessel_table(agg), _summary(agg, note), ""
+        note = ("Based on precomputed trajectories "
+                "(vessel_type and gear_type available).")
+        return _build_zone_map(df_inside), _vessel_table(agg), _summary(agg, note), "", (agg.to_dict("records") if not agg.empty else None)
+
+
+    @app.callback(
+        Output("prot-download-csv", "data"),
+        Input("prot-btn-export", "n_clicks"),
+        State("prot-store-agg", "data"),
+        prevent_initial_call=True,
+    )
+    def _export(n, store):
+        if not n or not store:
+            raise dash.exceptions.PreventUpdate
+        out = pd.DataFrame(store)
+        if "gear_type" not in out.columns:
+            out["gear_type"] = ""
+        cols = list(out.columns)
+        if "gear_type" in cols and "vessel_type" in cols:
+            cols.remove("gear_type")
+            cols.insert(cols.index("vessel_type") + 1, "gear_type")
+            out = out[cols]
+        return dcc.send_data_frame(out.to_csv, "protected_area_vessels.csv", index=False)

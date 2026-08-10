@@ -43,21 +43,21 @@ def layout():
         dcc.Store(id="stats-store-csv-df", data=None),
 
         html.Div([
-            html.Div([lbl("Année (pour les stats saisonnières)"),
+            html.Div([lbl("Years available in precalculated stats"),
                 dcc.Dropdown(id="stats-year", value=YEARS[-1], clearable=False,
                     options=[{"label": str(y), "value": y} for y in YEARS],
                     style={"width": "160px", "color": "#000"})],
                 style={"marginRight": "1.5rem"}),
 
-            html.Div([lbl("Importer un CSV téléchargé"),
+            html.Div([lbl("Import a downloaded CSV"),
                 dcc.Dropdown(id="stats-csv-selector",
                     options=[{"label": f["filename"], "value": f["path"]}
                              for f in list_downloaded_csvs(ROOT / "data")],
-                    value=None, placeholder="Choisir un CSV...",
+                    value=None, placeholder="Choose a CSV...",
                     style={"width": "320px", "color": "#000"})],
                 style={"marginRight": "1rem"}),
             html.Div([lbl(" "),
-                html.Button("Charger", id="stats-btn-load-csv", n_clicks=0,
+                html.Button("Load", id="stats-btn-load-csv", n_clicks=0,
                     style={"padding": "0.45rem 1.2rem", "background": PANEL,
                            "color": SOFT, "border": f"1px solid {BDR}",
                            "borderRadius": "6px", "cursor": "pointer"})]),
@@ -134,7 +134,7 @@ def register_callbacks(app):
             ], style={"display": "flex", "gap": "1rem", "flexWrap": "wrap", "marginBottom": "1rem"})
             sections.append(row2)
 
-        # ── Zones protégées par année ────────────────────────────────────────
+        # ── Protected areas ────────────────────────────────────────
         pa_stats = load_protected_area_stats()
         if pa_stats:
             sections.append(html.H6("Protected areas — vessels detected inside, by year",
@@ -149,7 +149,7 @@ def register_callbacks(app):
                 "Pas de fichier protected_areas.json trouvé.",
                 style={"color": DIM, "fontStyle": "italic"}))
 
-        # ── CSV importé (avec pays, puisque le CSV a "flag") ─────────────────
+        # ── Imported CSV stats ─────────────────
         if csv_error:
             sections.append(html.P(csv_error, style={"color": "#ff6b6b", "marginTop": "1rem"}))
 
@@ -194,7 +194,7 @@ def register_callbacks(app):
         return html.Div(sections), csv_json
 
 
-# ── 1. Vessel count by type (toutes années confondues) ─────────────────────────
+# ── 1. Vessel count by type ─────────────────────────
 
 def _graph_vessel_count_by_type(tys):
     by_type = tys.groupby("vessel_type")["n_vessels"].sum().sort_values(ascending=False)
@@ -213,7 +213,7 @@ def _graph_activity_by_year(tys):
     return dcc.Graph(figure=fig, config={"displayModeBar": False})
 
 
-# ── 3. Seasonal pattern by year (année sélectionnée) ────────────────────────────
+# ── 3. Seasonal pattern by year ────────────────────────────
 
 def _graph_seasonal_pattern(tys, year):
     ty = tys[tys["year"] == year]
@@ -224,7 +224,7 @@ def _graph_seasonal_pattern(tys, year):
     return dcc.Graph(figure=fig, config={"displayModeBar": False})
 
 
-# ── 4. Vessel type composition per season (année sélectionnée) ────────────────
+# ── 4. Vessel type composition per season ────────────────
 
 def _graph_type_composition_per_season(tys, year):
     ty = tys[tys["year"] == year]

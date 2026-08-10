@@ -27,7 +27,12 @@ AEGEAN_LAT_LONS = [
 AEGEAN_POLYGON = Polygon(AEGEAN_LAT_LONS)
 AEGEAN_GEOJSON = mapping(AEGEAN_POLYGON)
 
-# ── Options for the UI ─────────────────────────────────────────────────────────
+_AFE_REGION_POLY = Polygon([
+    (11.0, 33.0), (30.5, 33.0), (30.5, 36.5),
+    (26.5, 41.5), (22.0, 41.5), (11.0, 36.5), (11.0, 33.0),
+])
+
+# Options for the UI 
 
 GFW_VESSEL_TYPES = [
     "fishing",
@@ -246,3 +251,77 @@ def list_downloaded_csvs(data_dir) -> list[dict]:
                 p.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
         })
     return files
+
+
+# =============================================================================
+# AFE (Apparent Fishing Effort) -- porté depuis l'ancienne app Tkinter.
+# _AFE_REGION_POLY est déjà défini plus haut dans ce fichier.
+# =============================================================================
+
+async def load_AFE_data(flags, start, end, client, max_retries=10):
+    """
+    Télécharge l'effort de pêche apparent (AFE) pour un ou plusieurs pavillons,
+    sur la région Égée élargie. Ne garde que les navires de pêche.
+    Même gestion des 429 (rate limit) que load_VP_data.
+    """
+    region_geometry = mapping(_AFE_REGION_POLY)
+
+    if isinstance(flags, list):
+        flag_filter = "flag IN (" + ", ".join(["'{}'".format(f) for f in flags]) + ")"
+    else:
+        flag_filter = f"flag = '{flags}'"
+
+    api_filters = [flag_filter, "distance_from_port_km > 3"]
+
+    for attempt in range(max_retries):
+        try:
+            report = await client.fourwings.create_fishing_effort_report(
+                spatial_resolution="HIGH",
+                temporal_resolution="HOURLY",
+                group_by="VESSEL_ID",
+                filters=api_filters,
+                start_date=start,
+                end_date=end,
+                geojson=region_geometry,
+            )
+            break
+        except Exception as e:
+            msg = str(e)
+            is_rate_limit = ("429" in msg or "Too Many Requests" in msg
+                             or "concurrent report" in msg)
+            if is_rate_limit and attempt < max_retries - 1:
+                await asyncio.sleep(min(2 ** attempt, 30))
+                continue
+            raise
+
+    df = report.df()
+    if df.empty:
+        return df
+    if "vessel_type" in df.columns:
+        df = df[df["vessel_type"] == "FISHING"]
+    return df
+
+
+async def bulk_load_afe_to_csv(flags, start_date, end_date, client, csv_path,
+                               progress_callback=None):
+    """
+    Version AFE de bulk_load_data_to_csv : télécharge mois par mois et écrit
+    le CSV. Renvoie le chemin du CSV.
+    """
+    chunks = get_monthly_chunks(start_date, end_date)
+    all_months = []
+
+    for i, (start, end) in enumerate(chunks):
+        if progress_callback:
+            progress_callback(f"AFE {start} -> {end}...", (i + 1) / max(len(chunks), 1))
+        df_month = await load_AFE_data(flags, start, end, client)
+        if df_month is not None and not df_month.empty:
+            all_months.append(df_month)
+
+    if not all_months:
+        pd.DataFrame().to_csv(csv_path, index=False)
+        return csv_path
+
+    df = pd.concat(all_months, ignore_index=True)
+    df.to_csv(csv_path, index=False)
+    return csv_path

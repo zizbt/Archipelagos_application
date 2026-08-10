@@ -7,6 +7,10 @@ V1 fonctionnelle/
 *.parquet
 *.geojson
 
+# Api keys
+api_key.txt
+*api_key*
+
 # Shapefiles
 *.shp
 *.shx
