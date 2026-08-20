@@ -1,17 +1,8 @@
 """
 pages/encounters.py
 ===================
-Page "Encounters" -- detecte les rencontres entre navires : deux bateaux
-restes a moins de 500 m l'un de l'autre pendant 2 h ou plus.
-
-Meme structure que les autres pages :
-- Source de donnees : trajectoires precalculees via load_trajectories_range
-  (memes colonnes que la page Map : lat, lon, vessel_id, ship_name, date).
-- Sidebar avec plage de dates + bouton Analyze.
-- Carte pydeck (ScatterplotLayer) : un point par rencontre.
-- Table recapitulative + export CSV.
-
-La plage de dates peut chevaucher deux annees (ex. Dec 2024 -> Jan 2025).
+Page "Encounters" -- dection of vessel encounters: two vessels within
+DIST_THRESHOLD_M for TIME_THRESHOLD_H or more.
 """
 
 import json
@@ -32,19 +23,20 @@ from loader import load_trajectories_range
 
 TRAJECTORY_COLUMNS = ["lat", "lon", "vessel_id", "ship_name", "date"]
 
-# Bornes de dates de l'app
 GLOBAL_MIN_DATE = date(YEARS[0], 1, 1)
 GLOBAL_MAX_DATE = date(YEARS[-1], 12, 31)
 
-# Parametres de detection
 DIST_THRESHOLD_M = 500
 TIME_THRESHOLD_H = 2
 
-ENC_COLOR = [255, 0, 200, 180]   # rose/violet, comme tes points d'origine
-
+ENC_COLOR = [128, 0, 128, 200]
 
 def get_encounters_dataframe(df, dist_threshold_meters=DIST_THRESHOLD_M,
                              time_threshold_hours=TIME_THRESHOLD_H):
+    """
+    Dection of vessel encounters: two vessels within dist_threshold_meters for
+    time_threshold_hours or more.
+    """
     empty_cols = ['vessel_1', 'vessel_2', 'vessel_1_id', 'vessel_2_id',
                   'start', 'end', 'duration_hours', 'n_points',
                   'median_distance_m', 'reliability', 'lat', 'lon']
@@ -53,80 +45,94 @@ def get_encounters_dataframe(df, dist_threshold_meters=DIST_THRESHOLD_M,
         return pd.DataFrame(columns=empty_cols)
 
     gdf = gpd.GeoDataFrame(df.copy(), geometry=gpd.points_from_xy(df.lon, df.lat),
-                           crs="EPSG:4326")
-    gdf_metric = gdf.to_crs("EPSG:32634")
-    gdf_metric['date'] = pd.to_datetime(gdf_metric['date'])
-    gdf_metric = gdf_metric[['vessel_id', 'ship_name', 'date', 'geometry']].copy()
+                           crs="EPSG:4326").to_crs("EPSG:32634")
+    g = pd.DataFrame({
+        "vid": gdf["vessel_id"].astype(str).values,
+        "ship": gdf["ship_name"].astype(str).values if "ship_name" in gdf.columns else "",
+        "date": pd.to_datetime(gdf["date"].values),
+        "x": gdf.geometry.x.values,
+        "y": gdf.geometry.y.values,
+    })
+    cell = float(dist_threshold_meters)
+    g["tb"] = g["date"].dt.floor("30min").astype("int64")
+    g["cx"] = np.floor(g["x"] / cell).astype("int64")
+    g["cy"] = np.floor(g["y"] / cell).astype("int64")
+    g = g.reset_index(drop=True)
 
-    gdf_metric['x'] = gdf_metric.geometry.x
-    gdf_metric['y'] = gdf_metric.geometry.y
+    offsets = [(dx, dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)]
+    base = g[["tb", "cx", "cy", "vid", "ship", "date", "x", "y"]]
+    rights = []
+    for dx, dy in offsets:
+        r = base.copy()
+        r["cx"] = r["cx"] + dx
+        r["cy"] = r["cy"] + dy
+        rights.append(r)
+    right_all = pd.concat(rights, ignore_index=True)
+    m = base.merge(right_all, on=["tb", "cx", "cy"], suffixes=("_l", "_r"))
 
-    gdf_metric['tbucket'] = gdf_metric['date'].dt.floor('30min')
-
-    gdf_buffered = gdf_metric.copy()
-    gdf_buffered['geometry'] = gdf_buffered.geometry.buffer(dist_threshold_meters)
-
-    spatial_join = gpd.sjoin(gdf_metric, gdf_buffered, how='inner', predicate='within')
-
-    pairs = spatial_join[
-        spatial_join['vessel_id_left'] < spatial_join['vessel_id_right']
-    ].copy()
-    
-    pairs = pairs[pairs['tbucket_left'] == pairs['tbucket_right']]
-    if pairs.empty:
+    m = m[m["vid_l"] < m["vid_r"]]
+    if m.empty:
+        return pd.DataFrame(columns=empty_cols)
+    m["dist_m"] = np.hypot(m["x_l"].values - m["x_r"].values,
+                           m["y_l"].values - m["y_r"].values)
+    m = m[m["dist_m"] <= dist_threshold_meters]
+    if m.empty:
+        return pd.DataFrame(columns=empty_cols)
+    m["time_diff"] = (m["date_l"] - m["date_r"]).abs()
+    m = m[m["time_diff"] <= pd.Timedelta(minutes=30)]
+    if m.empty:
         return pd.DataFrame(columns=empty_cols)
 
-    right_xy = gdf_metric[['x', 'y']].rename(columns={'x': 'x_r', 'y': 'y_r'})
-    pairs = pairs.merge(right_xy, left_on='index_right', right_index=True, how='left')
-    pairs['dist_m'] = np.hypot(pairs['x'] - pairs['x_r'], pairs['y'] - pairs['y_r'])
+    cp = m[["vid_l", "vid_r", "ship_l", "ship_r", "date_l",
+            "x_l", "y_l", "x_r", "y_r", "dist_m"]].copy()
+    cp = cp.rename(columns={"date_l": "date"})
+    cp["pair"] = cp["vid_l"] + "_" + cp["vid_r"]
+    cp = cp.sort_values(["pair", "date"])
+    cp["gap"] = cp.groupby("pair")["date"].diff()
+    cp["grp"] = (cp["gap"] > pd.Timedelta(hours=1)).cumsum()
 
-    pairs['time_diff'] = (pairs['date_left'] - pairs['date_right']).abs()
-    close_pairs = pairs[pairs['time_diff'] <= pd.Timedelta(minutes=30)].copy()
-    if close_pairs.empty:
+    agg = cp.groupby(["pair", "grp"]).agg(
+        start=("date", "min"),
+        end=("date", "max"),
+        n_points=("date", "size"),
+        median_distance_m=("dist_m", "median"),
+        vessel_1=("ship_l", "first"),
+        vessel_2=("ship_r", "first"),
+        vessel_1_id=("vid_l", "first"),
+        vessel_2_id=("vid_r", "first"),
+        x_mid=("x_l", "median"),
+        y_mid=("y_l", "median"),
+        x1min=("x_l", "min"), x1max=("x_l", "max"),
+        y1min=("y_l", "min"), y1max=("y_l", "max"),
+        x2min=("x_r", "min"), x2max=("x_r", "max"),
+        y2min=("y_r", "min"), y2max=("y_r", "max"),
+    ).reset_index(drop=True)
+
+    agg["duration_hours"] = (agg["end"] - agg["start"]).dt.total_seconds() / 3600
+    agg = agg[agg["duration_hours"] >= time_threshold_hours]
+    if agg.empty:
         return pd.DataFrame(columns=empty_cols)
 
-    close_pairs['pair_id'] = (close_pairs['vessel_id_left'].astype(str) + "_"
-                              + close_pairs['vessel_id_right'].astype(str))
-    close_pairs = close_pairs.sort_values(['pair_id', 'date_left'])
-    close_pairs['time_gap'] = close_pairs.groupby('pair_id')['date_left'].diff()
-    close_pairs['group'] = (close_pairs['time_gap'] > pd.Timedelta(hours=1)).cumsum()
-
-    rows = []
-    for _, grp in close_pairs.groupby(['pair_id', 'group']):
-        start = grp['date_left'].min()
-        end = grp['date_left'].max()
-        dur = (end - start).total_seconds() / 3600
-        if dur < time_threshold_hours:
-            continue
-
-        n_points = len(grp)
-        median_dist = round(float(grp['dist_m'].median()), 1)
-        if n_points >= 8 and dur >= 4:
-            reliability = "high"
-        elif n_points >= 4:
-            reliability = "medium"
-        else:
-            reliability = "low"
-
-        mid = grp.iloc[len(grp) // 2]
-        pt = gpd.GeoSeries([mid['geometry']], crs="EPSG:32634").to_crs("EPSG:4326").iloc[0]
-
-        rows.append({
-            'vessel_1': mid['ship_name_left'],
-            'vessel_2': mid['ship_name_right'],
-            'vessel_1_id': mid['vessel_id_left'],
-            'vessel_2_id': mid['vessel_id_right'],
-            'start': start, 'end': end,
-            'duration_hours': round(dur, 2),
-            'n_points': n_points,
-            'median_distance_m': median_dist,
-            'reliability': reliability,
-            'lat': round(pt.y, 5), 'lon': round(pt.x, 5),
-        })
-
-    if not rows:
+    MOVE_MIN_M = 500.0
+    move1 = np.hypot(agg["x1max"] - agg["x1min"], agg["y1max"] - agg["y1min"])
+    move2 = np.hypot(agg["x2max"] - agg["x2min"], agg["y2max"] - agg["y2min"])
+    agg = agg[(move1 >= MOVE_MIN_M) | (move2 >= MOVE_MIN_M)]
+    if agg.empty:
         return pd.DataFrame(columns=empty_cols)
-    return pd.DataFrame(rows).sort_values('start').reset_index(drop=True)
+
+    agg["reliability"] = np.select(
+        [(agg["n_points"] >= 8) & (agg["duration_hours"] >= 4),
+         (agg["n_points"] >= 4)],
+        ["high", "medium"], default="low")
+
+    pts = gpd.GeoSeries(gpd.points_from_xy(agg["x_mid"], agg["y_mid"]),
+                        crs="EPSG:32634").to_crs("EPSG:4326")
+    agg["lat"] = pts.y.round(5).values
+    agg["lon"] = pts.x.round(5).values
+    agg["duration_hours"] = agg["duration_hours"].round(2)
+    agg["median_distance_m"] = agg["median_distance_m"].round(1)
+
+    return agg[empty_cols].sort_values("start").reset_index(drop=True)
 
 # LAYOUT
 def layout():
@@ -166,47 +172,56 @@ def layout():
                        "borderRadius": "6px", "cursor": "pointer", "fontWeight": "600",
                        "marginBottom": "0.6rem"}),
 
-            html.Button("Export CSV", id="enc-btn-export", n_clicks=0,
-                style={"width": "100%", "padding": "0.5rem",
-                       "background": PANEL, "color": SOFT,
-                       "border": f"1px solid {BDR}", "borderRadius": "6px",
-                       "cursor": "pointer", "marginBottom": "1rem"}),
-
             html.Div(id="enc-summary", style={"fontSize": "0.75rem", "color": SOFT}),
 
         ], style={"width": "280px", "minWidth": "280px", "padding": "1rem",
                    "background": BG, "borderRight": f"1px solid {BDR}",
                    "height": "calc(100vh - 52px)", "overflowY": "auto", "flexShrink": "0"}),
 
-        # ── Map + table ──────────────────────────────────────────
+        # ── Map full height + Export button top-right ────────────
         html.Div([
+            html.Div(
+                html.Button("Export CSV", id="enc-btn-export", n_clicks=0,
+                    style={"border": "none",
+                           "background": f"linear-gradient(135deg,{ACC},#0d4a7a)",
+                           "color": "white", "cursor": "pointer", "fontSize": "0.75rem",
+                           "fontWeight": "600", "padding": "0.3rem 1rem", "borderRadius": "5px"}),
+                style={"padding": "0.3rem 0.6rem", "background": BG,
+                       "borderBottom": f"1px solid {BDR}", "flexShrink": "0",
+                       "display": "flex", "justifyContent": "flex-end"},
+            ),
             html.Div([
                 dcc.Loading(type="circle", color=ACC,
                     parent_style={"height": "100%", "width": "100%"},
                     style={"height": "100%", "width": "100%"},
                     children=html.Div(id="enc-map-container", style={"height": "100%", "width": "100%"}),
                 ),
-            ], style={"flex": "1", "minHeight": 0}),
-
-            html.Div(
-                dcc.Loading(children=html.Div(id="enc-table")),
-                style={"height": "260px", "flexShrink": "0", "overflowY": "auto",
-                       "borderTop": f"1px solid {BDR}", "padding": "0.5rem 1rem", "background": BG},
-            ),
+                html.Div(id="enc-click-info",
+                    style={"position": "absolute", "top": "0.6rem", "left": "0.6rem",
+                           "maxWidth": "280px", "background": "rgba(26,13,42,0.95)",
+                           "border": "1px solid #6b2d8f", "borderRadius": "8px",
+                           "padding": "0.7rem 0.9rem", "color": "#e6d9f2",
+                           "fontSize": "0.75rem", "display": "none", "zIndex": "10"}),
+            ], style={"flex": "1", "minHeight": 0, "position": "relative"}),
         ], style={"flex": "1", "minHeight": 0, "display": "flex", "flexDirection": "column"}),
 
     ], style={"display": "flex", "height": "calc(100vh - 52px)"})
 
 
-# HELPERS carte + table
+# HELPERS carte
 def _build_map(enc_df):
     layers = []
     if enc_df is not None and not enc_df.empty:
         plot = enc_df.copy()
         plot["tooltip"] = (plot["vessel_1"].astype(str) + " <-> " + plot["vessel_2"].astype(str)
-                           + " (" + plot["duration_hours"].astype(str) + "h, "
-                           + plot["reliability"].astype(str) + ")")
-        # rayon proportionnel a la duree (min 300 m visuel)
+                           + " (" + plot["duration_hours"].astype(str) + "h)")
+        plot["v1"] = plot["vessel_1"].astype(str)
+        plot["v2"] = plot["vessel_2"].astype(str)
+        plot["s"] = plot["start"].astype(str)
+        plot["e"] = plot["end"].astype(str)
+        plot["dur"] = plot["duration_hours"].astype(str)
+        plot["dist"] = plot["median_distance_m"].astype(str)
+        plot["rel"] = plot["reliability"].astype(str)
         plot["radius"] = plot["duration_hours"].clip(lower=1) * 200
 
         layers.append(pdk.Layer(
@@ -214,7 +229,7 @@ def _build_map(enc_df):
             get_position=["lon", "lat"],
             get_fill_color=ENC_COLOR,
             get_radius="radius", radius_min_pixels=4, radius_max_pixels=40,
-            pickable=True, auto_highlight=True, opacity=0.5,
+            pickable=True, auto_highlight=True, opacity=0.7,
         ))
 
     deck = pdk.Deck(
@@ -226,34 +241,35 @@ def _build_map(enc_df):
         tooltip={"text": "{tooltip}"},
     )
     deck_json = json.loads(deck.to_json())
-    return dash_deck.DeckGL(data=deck_json, mapboxKey=MAPBOX_KEY,
+    return dash_deck.DeckGL(id="enc-deck", data=deck_json, mapboxKey=MAPBOX_KEY,
+                            tooltip={"text": "{tooltip}"},
                             style={"width": "100%", "height": "100%"})
 
 
-def _table(enc_df):
-    if enc_df is None or enc_df.empty:
-        return html.P("No encounter detected for this period.",
-                      style={"color": SOFT, "fontSize": "0.8rem"})
-    show = enc_df.copy()
-    show["start"] = show["start"].astype(str)
-    show["end"] = show["end"].astype(str)
-    cols = ['vessel_1', 'vessel_2', 'start', 'end', 'duration_hours',
-            'median_distance_m', 'reliability']
-    return dash_table.DataTable(
-        data=show[cols].to_dict("records"),
-        columns=[{"name": c.replace("_", " ").title(), "id": c} for c in cols],
-        style_table={"overflowX": "auto"},
-        style_cell={"backgroundColor": BG, "color": SOFT, "border": f"1px solid {BDR}",
-                    "fontSize": "0.72rem", "padding": "4px 8px"},
-        style_header={"backgroundColor": PANEL, "color": MAIN, "fontWeight": "600"},
-        page_size=20,
-    )
+def _click_panel(obj):
+    """Contenu du panneau affiche au clic sur un cercle (clickInfo.object)."""
+    if not obj:
+        return "", {"display": "none"}
+    v1 = obj.get("v1", "?")
+    v2 = obj.get("v2", "?")
+    body = html.Div([
+        html.Div([html.B(v1), " ↔ ", html.B(v2)], style={"marginBottom": "4px"}),
+        html.Div(f"Start: {obj.get('s', '-')}"),
+        html.Div(f"End: {obj.get('e', '-')}"),
+        html.Div(f"Duration: {obj.get('dur', '-')} h"),
+        html.Div(f"Median distance: {obj.get('dist', '-')} m"),
+        html.Div(f"Reliability: {obj.get('rel', '-')}"),
+    ])
+    return body, {"position": "absolute", "top": "0.6rem", "left": "0.6rem",
+                  "maxWidth": "280px", "background": "rgba(26,13,42,0.95)",
+                  "border": "1px solid #6b2d8f", "borderRadius": "8px",
+                  "padding": "0.7rem 0.9rem", "color": "#e6d9f2",
+                  "fontSize": "0.75rem", "display": "block", "zIndex": "10"}
 
 
 # CALLBACKS
 def register_callbacks(app):
 
-    # Raccourci "annee" -> remplit start/end
     @app.callback(
         Output("enc-start", "date"),
         Output("enc-end", "date"),
@@ -265,10 +281,8 @@ def register_callbacks(app):
             raise dash.exceptions.PreventUpdate
         return date(year, 1, 1), date(year, 1, 31)
 
-    # Analyze -- se declenche UNIQUEMENT au clic sur le bouton
     @app.callback(
         Output("enc-map-container", "children"),
-        Output("enc-table", "children"),
         Output("enc-summary", "children"),
         Output("enc-store", "data"),
         Input("enc-btn-run", "n_clicks"),
@@ -282,14 +296,24 @@ def register_callbacks(app):
 
         df = load_trajectories_range(start, end, None, None, columns=TRAJECTORY_COLUMNS)
         if df is None or df.empty:
-            return _build_map(None), _table(None), "No trajectory data for this range.", None
+            return _build_map(None), "No trajectory data for this range.", None
 
         enc = get_encounters_dataframe(df)
         summary = (f"{len(enc)} encounter(s) found "
                    f"({start} -> {end}).") if not enc.empty else "No encounter found."
         store = enc.assign(start=enc["start"].astype(str),
                            end=enc["end"].astype(str)).to_dict("records") if not enc.empty else None
-        return _build_map(enc), _table(enc), summary, store
+        return _build_map(enc), summary, store
+
+    @app.callback(
+        Output("enc-click-info", "children"),
+        Output("enc-click-info", "style"),
+        Input("enc-deck", "clickInfo"),
+        prevent_initial_call=True,
+    )
+    def _on_click(click_info):
+        obj = (click_info or {}).get("object")
+        return _click_panel(obj)
 
     # CSV Export
     @app.callback(

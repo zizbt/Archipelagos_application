@@ -48,7 +48,7 @@ GFW_VESSEL_TYPES = [
 COUNTRY_FLAGS = [
     "GRC", "TUR", "ITA", "MLT", "TUN", "CYP", "DZA", "ALB", "FRA",
     "ESP", "HRV", "MNE", "LBY", "EGY", "LBN", "SYR", "RUS", "UKR",
-    "ROU", "BGR", "GEO", "ISR", "LBR", "PAN", "BHS",
+    "ROU", "BGR", "GEO", "ISR", "LBR", "PAN", "BHS", "POL",
 ]
 
 # NOTE: gear_type n'est PAS filtrable au téléchargement (pas supporté par

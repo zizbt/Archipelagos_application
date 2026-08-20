@@ -6,7 +6,7 @@ Centralized configuration — paths, parameters, visual constants.
 
 from pathlib import Path
 
-# ── Folders ────────────────────────────────────────────────────────────────────
+# Folders
 
 ROOT           = Path(__file__).parent
 RAW_DATA       = ROOT / "data" / "raw"
@@ -20,7 +20,7 @@ GIS_DIR        = ROOT / "data" / "gis"
 for folder in [PRECOMPUTED, TRAJECTORY_DIR, HEATMAP_DIR, FILTER_DIR, STAT_DIR, GIS_DIR]:
     folder.mkdir(parents=True, exist_ok=True)
 
-# ── Time parameters ───────────────────────────────────────────────────────────
+# Time parameters
 
 YEARS = [2023, 2024, 2025, 2026]
 
@@ -49,7 +49,7 @@ ALL_TYPES    = "ALL"
 MAX_HEATMAP_POINTS = 1_000_000
 MAX_SCATTER_POINTS =  60_000
 
-# ── Maritime zones ─────────────────────────────────────────────────────────────
+# Maritime zones
 
 ZONES = {
     "greece_territorial": {
@@ -95,12 +95,44 @@ ZONES = {
         # SPA (bird protection zone under the EU Birds Directive)
         "label": "Fourni protected area",
     },
+    "italy_territorial": {
+        "shp":  "ZEE_and_territorial_water/ita_national_waters.geojson",
+        "label": "Italy national waters (12nm)",
+    },
+    "malta_fmz": {
+        "shp":  "ZEE_and_territorial_water/mlt_FMZ_waters.geojson",
+        "label": "Malta FMZ waters (25nm)",
+    },
+    "malta_national": {
+        "shp":  "ZEE_and_territorial_water/mlt_national_waters.geojson",
+        "label": "Malta national waters (12nm)",
+    },
+        "italy_territorial": {
+        "shp":  "ZEE_and_territorial_water/ita_national_waters.geojson",
+        "fill_color": [60, 179, 113, 35],
+        "line_color": [60, 179, 113, 230],
+        "line_width": 160,
+        "label": "Italy national waters (12nm)",
+    },
+    "malta_fmz": {
+        "shp":  "ZEE_and_territorial_water/mlt_FMZ_waters.geojson",
+        "fill_color": [255, 215, 0, 15],
+        "line_color": [255, 215, 0, 200],
+        "line_width": 70,
+        "label": "Malta FMZ waters (25nm)",
+    },
+    "malta_national": {
+        "shp":  "ZEE_and_territorial_water/mlt_national_waters.geojson",
+        "fill_color": [255, 165, 0, 35],
+        "line_color": [255, 165, 0, 230],
+        "line_width": 160,
+        "label": "Malta national waters (12nm)",
+    },
 }
 
-# Centre approximatif de l'archipel de Fourni (pour zoomer la carte dessus)
 FOURNI_CENTER = {"lat": 37.557, "lon": 26.472}
 
-# ── Colors per vessel type ──────────────────────────────────────────────────────
+# Colors per vessel type
 
 TYPE_COLORS = {
     "PASSENGER":      [ 50, 205,  50, 210],   # green (was passenger green)
@@ -116,7 +148,7 @@ TYPE_COLORS = {
 }
 DEFAULT_COLOR = [200, 200, 200, 150]
 
-# ── Flags ──────────────────────────────────────────────────────────────────────
+# Flags
 
 FLAG_NAMES = {
     "FRA": "France", "ATF": "Kerguelen Islands", "RIF": "French International Register",

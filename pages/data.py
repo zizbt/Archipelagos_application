@@ -27,50 +27,6 @@ from config import FLAG_NAMES
 from gfw import (get_gfw_client, bulk_load_data_to_csv, bulk_load_afe_to_csv,
                 GFW_VESSEL_TYPES, COUNTRY_FLAGS)
 
-async def load_AFE_data(flags, start, end, client, max_retries=10):
-    """
-    Télécharge l'effort de pêche apparent (AFE) pour un ou plusieurs pavillons,
-    sur la région Égée élargie. Ne garde que les navires de pêche.
-    Même gestion des 429 (rate limit) que load_VP_data.
-    """
-    region_geometry = mapping(_AFE_REGION_POLY)
-
-    if isinstance(flags, list):
-        flag_filter = "flag IN (" + ", ".join(["'{}'".format(f) for f in flags]) + ")"
-    else:
-        flag_filter = f"flag = '{flags}'"
-
-    api_filters = [flag_filter, "distance_from_port_km > 3"]
-
-    import asyncio
-    for attempt in range(max_retries):
-        try:
-            report = await client.fourwings.create_fishing_effort_report(
-                spatial_resolution="HIGH",
-                temporal_resolution="HOURLY",
-                group_by="VESSEL_ID",
-                filters=api_filters,
-                start_date=start,
-                end_date=end,
-                geojson=region_geometry,
-            )
-            break
-        except Exception as e:
-            msg = str(e)
-            is_rate_limit = ("429" in msg or "Too Many Requests" in msg
-                             or "concurrent report" in msg)
-            if is_rate_limit and attempt < max_retries - 1:
-                await asyncio.sleep(min(2 ** attempt, 30))
-                continue
-            raise
-
-    df = report.df()
-    if df.empty:
-        return df
-    if "vessel_type" in df.columns:
-        df = df[df["vessel_type"] == "FISHING"]
-    return df
-
 def _download_panel(prefix, title, subtitle, show_vtypes=True):
     """prefix = 'vp' ou 'afe' -> sert à préfixer tous les id du panneau."""
     children = [
@@ -229,7 +185,7 @@ def register_callbacks(app):
                 return "Download in progress...";
             }
             """,
-            Output(f"{prefix}-status", "children", allow_duplicate=True),
+            Output(f"{prefix}-status", "children"),
             Input(f"{prefix}-btn", "n_clicks"),
             prevent_initial_call=True,
         )
@@ -237,8 +193,6 @@ def register_callbacks(app):
     # Download VP
     @app.callback(
         Output("vp-status", "children", allow_duplicate=True),
-        Output("store-csv-path", "data", allow_duplicate=True),
-        Output("data-active-dataset", "children", allow_duplicate=True),
         Output("vp-file-download", "data"),
         Input("vp-btn", "n_clicks"),
         State("vp-start", "date"), State("vp-end", "date"),
@@ -250,20 +204,18 @@ def register_callbacks(app):
             raise dash.exceptions.PreventUpdate
         msg, path, info = _do_download("VP", start, end, flags, vtypes)
         if path is None:
-            return msg, dash.no_update, dash.no_update, dash.no_update
+            return msg, dash.no_update
         # lit le fichier en mémoire, l'envoie au navigateur, puis nettoie le disque
         send = dcc.send_file(path)
         try:
             os.remove(path)
         except OSError:
             pass
-        return msg, dash.no_update, dash.no_update, send
+        return msg, send
 
     # Download AFE
     @app.callback(
         Output("afe-status", "children", allow_duplicate=True),
-        Output("store-csv-path", "data", allow_duplicate=True),
-        Output("data-active-dataset", "children", allow_duplicate=True),
         Output("afe-file-download", "data"),
         Input("afe-btn", "n_clicks"),
         State("afe-start", "date"), State("afe-end", "date"),
@@ -275,10 +227,10 @@ def register_callbacks(app):
             raise dash.exceptions.PreventUpdate
         msg, path, info = _do_download("AFE", start, end, flags, vtypes)
         if path is None:
-            return msg, dash.no_update, dash.no_update, dash.no_update
+            return msg, dash.no_update
         send = dcc.send_file(path)
         try:
             os.remove(path)
         except OSError:
             pass
-        return msg, dash.no_update, dash.no_update, send
+        return msg, send

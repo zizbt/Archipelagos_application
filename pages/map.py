@@ -379,24 +379,8 @@ def _build_map(df, show_all_paths=False):
 
 def register_callbacks(app):
 
-    # Sync the "Select / deselect all" master checkbox with the type list.
-    # Bidirectional: clicking the master toggles every type; ticking the
-    # individual boxes updates whether the master appears checked.
-    @app.callback(
-        Output("map-type-filter", "value"),
-        Output("map-type-select-all", "value"),
-        Input("map-type-select-all", "value"),
-        Input("map-type-filter", "value"),
-    )
-    def _sync_select_all(master, selected):
-        trigger = (dash.callback_context.triggered_id
-                   if dash.callback_context.triggered else None)
-        if trigger == "map-type-select-all":
-            if "all" in (master or []):
-                return list(VESSEL_TYPES), ["all"]
-            return [], []
-        master_val = ["all"] if set(selected or []) == set(VESSEL_TYPES) else []
-        return selected, master_val
+    # "Deselect all / Select all" button: toggles the whole type list and
+    # flips its own label to match the resulting state.
     @app.callback(
         Output("map-type-filter", "value"),
         Output("map-type-select-all", "children"),

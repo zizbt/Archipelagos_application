@@ -107,6 +107,44 @@ def _aggregate_by_vessel(df):
     result["last_seen"] = result["last_seen"].dt.strftime("%Y-%m-%d %H:%M")
     if "flag" in result.columns:
         result["flag_label"] = result["flag"].map(lambda f: f"{FLAG_NAMES.get(f, f)} ({f})")
+
+    # Per-visit breakdown: each distinct crossing of the zone, with its
+    # exact start timestamp, end timestamp, and duration. Consecutive
+    # positions belong to the same visit; a gap larger than
+    # VISIT_GAP_THRESHOLD means the vessel left and came back later, so a
+    # new visit starts. Formatted as a single human-readable string per
+    # vessel, e.g. "2026-01-01 12:03 -> 2026-01-02 13:05 (1h02), 2026-02-20 09:10 -> 2026-02-20 11:40 (2h30)".
+    # NOTE: comma-separated (not semicolon) -- semicolons get read as a
+    # column delimiter by some Excel locales (e.g. French), which was
+    # spilling multiple visits into columns B, C, etc. instead of staying
+    # in a single cell. Using a comma is safe here: pandas.to_csv quotes
+    # any field that contains the delimiter, so this whole string stays
+    # wrapped in double quotes as one CSV field.
+    VISIT_GAP_THRESHOLD = pd.Timedelta(hours=3)
+
+    def _format_duration(dur):
+        total_minutes = int(dur.total_seconds() // 60)
+        h, m = divmod(total_minutes, 60)
+        return f"{h}h{m:02d}"
+
+    def _format_visits(group):
+        group = group.sort_values("date")
+        gap = group["date"].diff()
+        visit_id = (gap > VISIT_GAP_THRESHOLD).cumsum()
+        parts = []
+        for _, visit in group.groupby(visit_id):
+            v_start = visit["date"].min()
+            v_end = visit["date"].max()
+            duration = _format_duration(v_end - v_start)
+            parts.append(
+                f"{v_start.strftime('%Y-%m-%d %H:%M')} -> "
+                f"{v_end.strftime('%Y-%m-%d %H:%M')} ({duration})"
+            )
+        return ", ".join(parts)
+
+    breakdown = df.groupby("vessel_id").apply(_format_visits, include_groups=False)
+    result["dates_and_hours"] = result["vessel_id"].map(breakdown)
+
     return result.sort_values("hours_detected", ascending=False)
 
 
@@ -328,13 +366,15 @@ def _vessel_table(agg):
         return html.P("No vessel detected in the zone for this period.",
                        style={"color": DIM, "fontStyle": "italic"})
     cols = ["vessel_id"]
-    for c in ["ship_name", "flag_label", "vessel_type", "gear_type", "hours_detected", "first_seen", "last_seen"]:
+    for c in ["ship_name", "flag_label", "vessel_type", "gear_type", "hours_detected",
+              "first_seen", "last_seen", "dates_and_hours"]:
         if c in agg.columns:
             cols.append(c)
     display_names = {
         "vessel_id": "Vessel Id", "ship_name": "Ship Name", "flag_label": "Flag",
         "vessel_type": "Vessel Type", "gear_type": "Gear Type",
         "hours_detected": "Hours Detected", "first_seen": "First Seen", "last_seen": "Last Seen",
+        "dates_and_hours": "Crossings (start -> end, duration)",
     }
     return dash_table.DataTable(
         data=agg[cols].to_dict("records"),
@@ -483,4 +523,11 @@ def register_callbacks(app):
             cols.remove("gear_type")
             cols.insert(cols.index("vessel_type") + 1, "gear_type")
             out = out[cols]
-        return dcc.send_data_frame(out.to_csv, "protected_area_vessels.csv", index=False)
+        # sep=";" -- French-locale Excel opens .csv files using semicolon as
+        # the column delimiter by default. With the default comma delimiter,
+        # Excel-FR doesn't split the file into columns at all (everything
+        # lands in column A). Using ";" here matches that default, so every
+        # real column (vessel_id, ship_name, dates_and_hours...) splits
+        # correctly. The commas inside dates_and_hours (separating multiple
+        # visits) stay untouched since they're no longer the delimiter.
+        return dcc.send_data_frame(out.to_csv, "protected_area_vessels.csv", index=False, sep=";")

@@ -22,10 +22,10 @@ from pages import stats as page_stats
 from pages import protected as page_protected
 from pages import encounter as page_encounters
 from pages import loitering as page_loitering
-from pages import afe_report as page_afe_report
+from pages import report as page_report
 from pages import ports as page_ports
 
-# ── App ────────────────────────────────────────────────────────────────────────
+# App
 
 app = dash.Dash(
     __name__,
@@ -36,7 +36,8 @@ app = dash.Dash(
 server = app.server
 
 PAGES = {
-    "data":        {"label": "Data (download)",       "layout": page_data.layout},
+    "data":        {"label": "Data (download)",        "layout": page_data.layout},
+    "report":      {"label": "Report",                 "layout": page_report.layout},
     "map":         {"label": "Map & Trajectories",     "layout": page_map.layout},
     "heatmap":     {"label": "Heatmaps",               "layout": page_heatmap.layout},
     "stats":       {"label": "Statistics",             "layout": page_stats.layout},
@@ -44,7 +45,6 @@ PAGES = {
     "encounters":  {"label": "Encounters",             "layout": page_encounters.layout},
     "loitering":   {"label": "Loitering",              "layout": page_loitering.layout},
     "ports":       {"label": "Port visits",            "layout": page_ports.layout},
-    "afe_report":  {"label": "AFE Report",             "layout": page_afe_report.layout},
 }
 
 DEFAULT_PAGE = "data"
@@ -56,7 +56,7 @@ MODAL_OVERLAY_STYLE = {
     "background": "rgba(0,0,0,0.6)", "zIndex": 9999,
 }
 
-# ── Navigation ──────────────────────────────────────────────────────────────────
+# Navigation
 
 def _nav_button(key, label, active):
     return html.Button(
@@ -96,7 +96,7 @@ def build_nav(active_key):
     })
 
 
-# ── Overall layout ──────────────────────────────────────────────────────────────
+# Overall layout
 
 app.layout = html.Div([
     dcc.Store(id="store-csv-path", data=None),
@@ -104,7 +104,6 @@ app.layout = html.Div([
     dcc.Store(id="nav-active", data=DEFAULT_PAGE),
     dcc.Store(id="api-key-present", data=has_api_key()),
 
-    # ── Pop-up de saisie de la clé API (cachée par défaut) ──
     html.Div(
         id="api-key-modal",
         children=html.Div([
@@ -166,7 +165,6 @@ def render_page(_clicks, current):
     return page["layout"](), build_nav(page_key), page_key, modal_style
 
 
-
 @app.callback(
     Output("api-key-modal", "style", allow_duplicate=True),
     Output("api-key-modal-status", "children"),
@@ -185,7 +183,7 @@ def _save_key(n, key):
     return {"display": "none"}, "", True
 
 
-# ── Register each page's callbacks ──────────────────────────────────────────────
+# Register each page's callbacks
 
 page_data.register_callbacks(app)
 page_map.register_callbacks(app)
@@ -194,6 +192,7 @@ page_stats.register_callbacks(app)
 page_protected.register_callbacks(app)
 page_encounters.register_callbacks(app)
 page_loitering.register_callbacks(app)
+page_report.register_callbacks(app)
 page_ports.register_callbacks(app)
 if __name__ == "__main__":
     # threaded=False: the server handles one request at a time. Combined

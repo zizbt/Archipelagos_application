@@ -64,6 +64,8 @@ ZONE_LAYERS = {}
 for key, zone in ZONES.items():
     gj = load_geojson(key)
     if gj:
+        if "fill_color" not in zone or "line_color" not in zone:
+            raise KeyError(f"Zone '{key}' is missing 'fill_color' or 'line_color'. Zone dict: {zone}")
         ZONE_LAYERS[key] = pdk.Layer(
             "GeoJsonLayer", data=gj, stroked=True, filled=True,
             get_fill_color=zone["fill_color"], get_line_color=zone["line_color"],
