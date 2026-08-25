@@ -24,6 +24,7 @@ from pages import encounter as page_encounters
 from pages import loitering as page_loitering
 from pages import report as page_report
 from pages import ports as page_ports
+from pages import ais_gap as page_ais_gap
 
 # App
 
@@ -45,10 +46,11 @@ PAGES = {
     "encounters":  {"label": "Encounters",             "layout": page_encounters.layout},
     "loitering":   {"label": "Loitering",              "layout": page_loitering.layout},
     "ports":       {"label": "Port visits",            "layout": page_ports.layout},
+    "ais_gap":     {"label": "AIS Gaps",                "layout": page_ais_gap.layout},
 }
 
 DEFAULT_PAGE = "data"
-PAGES_NEEDING_KEY = {"data", "ports"}
+PAGES_NEEDING_KEY = {"data", "ports", "ais_gap"}
 
 MODAL_OVERLAY_STYLE = {
     "display": "flex", "alignItems": "center", "justifyContent": "center",
@@ -194,6 +196,7 @@ page_encounters.register_callbacks(app)
 page_loitering.register_callbacks(app)
 page_report.register_callbacks(app)
 page_ports.register_callbacks(app)
+page_ais_gap.register_callbacks(app)
 if __name__ == "__main__":
     # threaded=False: the server handles one request at a time. Combined
     # with the 429 retries in gfw.py, this prevents a double-click or a

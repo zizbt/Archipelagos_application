@@ -314,7 +314,7 @@ def _panel_style():
             "padding": "1.2rem", "flex": "1", "minWidth": "320px"}
 
 
-def layout():
+def _classic_layout():
     zones_txt = ", ".join(ZONES[k].get("label", k) for k in REPORT_ZONE_KEYS) or "no zone configured"
     csv_options = [{"label": f["filename"], "value": f["path"]} for f in list_downloaded_csvs(ROOT / "data")]
 
@@ -387,7 +387,30 @@ def layout():
     ], style={"padding": "1.5rem", "background": BG, "minHeight": "calc(100vh - 52px)"})
 
 
-def _afe_table(long_df):
+def layout():
+    """Point d'entree de la page 'Report' : un selecteur en haut permet de
+    basculer entre le rapport classique (VP/AFE depuis un CSV telecharge)
+    et le rapport par navire (recherche + evenements GFW), sans occuper
+    deux onglets separes dans la barre de navigation."""
+    from pages import vessel_report as page_vessel_report
+
+    return html.Div([
+        html.Div([
+            lbl("Report type"),
+            dcc.RadioItems(
+                id="report-mode",
+                options=[
+                    {"label": " Classic Report (VP / AFE from CSV)", "value": "classic"},
+                    {"label": " Vessel Report (search a vessel)", "value": "vessel"},
+                ],
+                value="classic",
+                labelStyle={"display": "inline-block", "marginRight": "1.5rem",
+                            "fontSize": "0.8rem", "color": SOFT, "cursor": "pointer"},
+            ),
+        ], style={"padding": "1rem 1.5rem 0 1.5rem", "background": BG}),
+
+        html.Div(id="report-mode-content", children=_classic_layout()),
+    ])
     if long_df is None or long_df.empty:
         return html.P("No fishing effort found in the configured zones for this CSV.",
                       style={"color": SOFT, "fontSize": "0.85rem"})
@@ -457,6 +480,19 @@ def _save_vp_report(report_df, totals, meta, source_csv_path):
 
 # CALLBACKS
 def register_callbacks(app):
+
+    from pages import vessel_report as page_vessel_report
+    page_vessel_report.register_callbacks(app)
+
+    @app.callback(
+        Output("report-mode-content", "children"),
+        Input("report-mode", "value"),
+        prevent_initial_call=True,
+    )
+    def _switch_report_mode(mode):
+        if mode == "vessel":
+            return page_vessel_report.layout()
+        return _classic_layout()
 
     @app.callback(
         Output("report-table", "children"),
