@@ -44,6 +44,8 @@ def get_encounters_dataframe(df, dist_threshold_meters=DIST_THRESHOLD_M,
     if df is None or df.empty or 'vessel_id' not in df.columns:
         return pd.DataFrame(columns=empty_cols)
 
+    from scipy.spatial import cKDTree
+
     gdf = gpd.GeoDataFrame(df.copy(), geometry=gpd.points_from_xy(df.lon, df.lat),
                            crs="EPSG:4326").to_crs("EPSG:32634")
     g = pd.DataFrame({
@@ -53,35 +55,56 @@ def get_encounters_dataframe(df, dist_threshold_meters=DIST_THRESHOLD_M,
         "x": gdf.geometry.x.values,
         "y": gdf.geometry.y.values,
     })
-    cell = float(dist_threshold_meters)
-    g["tb"] = g["date"].dt.floor("30min").astype("int64")
-    g["cx"] = np.floor(g["x"] / cell).astype("int64")
-    g["cy"] = np.floor(g["y"] / cell).astype("int64")
+    g["tb"] = g["date"].dt.floor("30min")
     g = g.reset_index(drop=True)
 
-    offsets = [(dx, dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)]
-    base = g[["tb", "cx", "cy", "vid", "ship", "date", "x", "y"]]
-    rights = []
-    for dx, dy in offsets:
-        r = base.copy()
-        r["cx"] = r["cx"] + dx
-        r["cy"] = r["cy"] + dy
-        rights.append(r)
-    right_all = pd.concat(rights, ignore_index=True)
-    m = base.merge(right_all, on=["tb", "cx", "cy"], suffixes=("_l", "_r"))
+    # Build candidate pairs per time bucket using a KD-tree instead of a
+    # 9x-shifted grid cross-join, which can blow up memory when many points
+    # share the same/adjacent grid cells (e.g. vessels idling in port).
+    pair_rows = []
+    for tb, grp in g.groupby("tb", sort=False):
+        n = len(grp)
+        if n < 2:
+            continue
+        coords = grp[["x", "y"]].to_numpy()
+        tree = cKDTree(coords)
+        # query_pairs returns each unordered pair of points within radius once
+        pairs = tree.query_pairs(r=dist_threshold_meters, output_type="ndarray")
+        if pairs.size == 0:
+            continue
+        idx_l = grp.index.to_numpy()[pairs[:, 0]]
+        idx_r = grp.index.to_numpy()[pairs[:, 1]]
+        pair_rows.append(np.column_stack([idx_l, idx_r]))
 
-    m = m[m["vid_l"] < m["vid_r"]]
+    if not pair_rows:
+        return pd.DataFrame(columns=empty_cols)
+
+    idx_pairs = np.concatenate(pair_rows, axis=0)
+    left = g.loc[idx_pairs[:, 0]].reset_index(drop=True)
+    right = g.loc[idx_pairs[:, 1]].reset_index(drop=True)
+    m = left.join(right, lsuffix="_l", rsuffix="_r")
+
+    # keep a consistent vid ordering per pair, dedupe identical pairs across
+    # buckets, and drop self-pairs of the same vessel
+    swap = m["vid_l"].to_numpy() > m["vid_r"].to_numpy()
+    if swap.any():
+        for c in ["vid", "ship", "date", "x", "y"]:
+            l = m[f"{c}_l"].to_numpy().copy()
+            r = m[f"{c}_r"].to_numpy().copy()
+            l[swap], r[swap] = r[swap], l[swap]
+            m[f"{c}_l"] = l
+            m[f"{c}_r"] = r
+    m = m[m["vid_l"] != m["vid_r"]]
     if m.empty:
         return pd.DataFrame(columns=empty_cols)
+
     m["dist_m"] = np.hypot(m["x_l"].values - m["x_r"].values,
                            m["y_l"].values - m["y_r"].values)
-    m = m[m["dist_m"] <= dist_threshold_meters]
-    if m.empty:
-        return pd.DataFrame(columns=empty_cols)
     m["time_diff"] = (m["date_l"] - m["date_r"]).abs()
     m = m[m["time_diff"] <= pd.Timedelta(minutes=30)]
     if m.empty:
         return pd.DataFrame(columns=empty_cols)
+    m = m.drop_duplicates(subset=["vid_l", "vid_r", "date_l", "date_r"])
 
     cp = m[["vid_l", "vid_r", "ship_l", "ship_r", "date_l",
             "x_l", "y_l", "x_r", "y_r", "dist_m"]].copy()
