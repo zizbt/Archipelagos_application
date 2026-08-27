@@ -13,7 +13,7 @@ from dash import dcc, html, Input, Output, State, ALL, ctx, no_update
 import dash_bootstrap_components as dbc
 
 from api_key import get_api_key, save_api_key, has_api_key
-from shared import BG, PANEL, BDR, DIM, MAIN, ACC, SOFT
+from shared import BG, PANEL, PANEL_2, BDR, DIM, MAIN, ACC, SOFT, GOOD
 
 from pages import data as page_data
 from pages import map as page_map
@@ -25,6 +25,7 @@ from pages import loitering as page_loitering
 from pages import report as page_report
 from pages import ports as page_ports
 from pages import ais_gap as page_ais_gap
+from pages import alerts as page_alerts
 
 # App
 
@@ -38,7 +39,8 @@ server = app.server
 
 PAGES = {
     "data":        {"label": "Data (download)",        "layout": page_data.layout},
-    "report":      {"label": "Report",                 "layout": page_report.layout},
+    "report":      {"label": "Reports",                "layout": page_report.layout},
+    "ais_gap":     {"label": "AIS Gaps",               "layout": page_ais_gap.layout},
     "map":         {"label": "Map & Trajectories",     "layout": page_map.layout},
     "heatmap":     {"label": "Heatmaps",               "layout": page_heatmap.layout},
     "stats":       {"label": "Statistics",             "layout": page_stats.layout},
@@ -46,7 +48,7 @@ PAGES = {
     "encounters":  {"label": "Encounters",             "layout": page_encounters.layout},
     "loitering":   {"label": "Loitering",              "layout": page_loitering.layout},
     "ports":       {"label": "Port visits",            "layout": page_ports.layout},
-    "ais_gap":     {"label": "AIS Gaps",                "layout": page_ais_gap.layout},
+    "alerts":      {"label": "Alerts",                 "layout": page_alerts.layout},
 }
 
 DEFAULT_PAGE = "data"
@@ -66,14 +68,15 @@ def _nav_button(key, label, active):
         id={"type": "nav-link", "key": key},
         n_clicks=0,
         style={
-            "border": "none",
-            "background": "transparent",
-            "color": ACC if active else SOFT,
-            "fontWeight": "700" if active else "500",
-            "fontSize": "0.9rem",
+            "border": f"1px solid {BDR}" if active else "1px solid transparent",
+            "background": PANEL_2 if active else "transparent",
+            "color": MAIN if active else SOFT,
+            "fontWeight": "800" if active else "600",
+            "fontSize": "0.86rem",
             "cursor": "pointer",
-            "padding": "0.2rem 0.1rem",
-            "borderBottom": f"2px solid {ACC}" if active else "2px solid transparent",
+            "padding": "0.45rem 0.75rem",
+            "borderRadius": "999px",
+            "boxShadow": "0 10px 24px rgba(0,0,0,0.16)" if active else "none",
             "whiteSpace": "nowrap",
         },
     )
@@ -81,19 +84,29 @@ def _nav_button(key, label, active):
 
 def build_nav(active_key):
     return html.Div([
-        html.Span("Aegean Vessel Tracker", style={
-            "color": MAIN, "fontWeight": "700", "fontSize": "0.95rem",
-            "marginRight": "1.8rem", "whiteSpace": "nowrap", "flexShrink": "0",
-        }),
+        html.Div([
+            html.Div("Aegean Vessel Tracker", style={
+                "color": MAIN,
+                "fontWeight": "900",
+                "fontSize": "1rem",
+                "letterSpacing": "0.02em",
+                "whiteSpace": "nowrap",
+            }),
+            html.Div("Vessel surveillance and reporting", style={
+                "color": SOFT,
+                "fontSize": "0.68rem",
+                "marginTop": "0.12rem",
+            }),
+        ], style={"display": "flex", "flexDirection": "column", "marginRight": "1.6rem", "flexShrink": "0"}),
         html.Div(
             [_nav_button(k, v["label"], k == active_key) for k, v in PAGES.items()],
-            style={"display": "flex", "alignItems": "center", "gap": "1.2rem",
-                   "flexWrap": "wrap"},
+            style={"display": "flex", "alignItems": "center", "gap": "0.55rem", "flexWrap": "wrap"},
         ),
     ], style={
         "display": "flex", "alignItems": "center",
-        "padding": "0.6rem 1.2rem", "background": PANEL,
-        "borderBottom": f"2px solid {ACC}",
+        "padding": "0.7rem 1.15rem", "background": f"linear-gradient(180deg,{PANEL} 0%,{BG} 100%)",
+        "borderBottom": f"1px solid {BDR}",
+        "boxShadow": "0 8px 30px rgba(0,0,0,0.22)",
         "minHeight": "52px", "boxSizing": "border-box",
     })
 
@@ -101,6 +114,16 @@ def build_nav(active_key):
 # Overall layout
 
 app.layout = html.Div([
+    html.Div(style={
+        "position": "fixed",
+        "inset": 0,
+        "background": (
+            "radial-gradient(circle at 18% 18%, rgba(44,134,209,0.14), transparent 26%),"
+            "radial-gradient(circle at 82% 12%, rgba(97,211,155,0.10), transparent 22%),"
+            "radial-gradient(circle at 50% 88%, rgba(224,176,112,0.08), transparent 25%)"
+        ),
+        "pointerEvents": "none",
+    }),
     dcc.Store(id="store-csv-path", data=None),
     dcc.Store(id="store-df", data=None),
     dcc.Store(id="nav-active", data=DEFAULT_PAGE),
@@ -128,17 +151,17 @@ app.layout = html.Div([
                        "background": f"linear-gradient(135deg,{ACC},#0d4a7a)",
                        "color": "white", "border": "none", "borderRadius": "6px",
                        "cursor": "pointer", "fontWeight": "600"}),
-        ], style={"background": PANEL, "padding": "2rem", "borderRadius": "10px",
+        ], style={"background": f"linear-gradient(180deg,{PANEL} 0%,{PANEL_2} 100%)", "padding": "2rem", "borderRadius": "18px",
                    "width": "440px", "maxWidth": "90vw",
                    "border": f"1px solid {BDR}",
-                   "boxShadow": "0 10px 40px rgba(0,0,0,0.5)"}),
+                   "boxShadow": "0 24px 70px rgba(0,0,0,0.5)"}),
         style={"display": "none"},
     ),
 
     html.Div(id="nav-bar-container", children=build_nav(DEFAULT_PAGE)),
     html.Div(id="page-content"),
 
-], style={"margin": 0, "padding": 0, "background": BG, "minHeight": "100vh"})
+], style={"margin": 0, "padding": 0, "background": BG, "minHeight": "100vh", "position": "relative", "overflowX": "hidden"})
 
 
 @app.callback(
@@ -148,12 +171,15 @@ app.layout = html.Div([
     Output("api-key-modal", "style"),
     Input({"type": "nav-link", "key": ALL}, "n_clicks"),
     State("nav-active", "data"),
+    Input("nav-active", "data"),
     prevent_initial_call=False,
 )
-def render_page(_clicks, current):
+def render_page(_clicks, current, active_page):
     trig = ctx.triggered_id
     if isinstance(trig, dict) and trig.get("type") == "nav-link":
         page_key = trig["key"]
+    elif active_page:
+        page_key = active_page
     else:
         page_key = current or DEFAULT_PAGE
 
@@ -195,6 +221,7 @@ page_protected.register_callbacks(app)
 page_encounters.register_callbacks(app)
 page_loitering.register_callbacks(app)
 page_report.register_callbacks(app)
+page_alerts.register_callbacks(app)
 page_ports.register_callbacks(app)
 page_ais_gap.register_callbacks(app)
 if __name__ == "__main__":

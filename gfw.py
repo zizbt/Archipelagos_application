@@ -258,20 +258,60 @@ def list_downloaded_csvs(data_dir) -> list[dict]:
 # _AFE_REGION_POLY est déjà défini plus haut dans ce fichier.
 # =============================================================================
 
-async def load_AFE_data(flags, start, end, client, max_retries=10):
+async def load_AFE_data(flags, start, end, client, vessel_types=None, vessel_ids=None,
+                        max_retries=10):
     """
-    Télécharge l'effort de pêche apparent (AFE) pour un ou plusieurs pavillons,
-    sur la région Égée élargie. Ne garde que les navires de pêche.
+    Télécharge l'effort de pêche apparent (AFE) sur la région Égée élargie,
+    avec filtres optionnels et combinables :
+      - flags        : pavillon(s) (liste ou string). Peut être None/vide si
+                        vessel_ids est fourni (mode single vessel : le
+                        vessel_id suffit, pas besoin de filtrer par pavillon).
+      - vessel_types : type(s) de navire GFW (ex: "fishing"), meme logique
+                        que load_VP_data.
+      - vessel_ids   : identifiant(s) GFW precis (mode single vessel), meme
+                        principe que le filtre flag/vessel_type -- une
+                        clause "vessel_id = '...'" / "vessel_id IN (...)"
+                        est ajoutee a la liste de filtres. NOTE : la
+                        colonne vessel_id est bien presente dans les
+                        resultats (group_by="VESSEL_ID"), mais la
+                        possibilite de filtrer DESSUS cote API n'a pas pu
+                        etre confirmee avec la doc en direct -- si l'API
+                        rejette ce filtre, l'erreur GFW remontera telle
+                        quelle a l'appelant (a ajuster si besoin, sur le
+                        meme modele que la remarque equivalente dans
+                        pages/ais_gap.py::load_ais_gaps_bulk).
+    Ne garde que les navires de pêche (vessel_type == FISHING) SAUF si
+    vessel_ids est fourni : dans ce cas le navire demande est garde tel
+    quel, meme si GFW ne le categorise pas FISHING.
     Même gestion des 429 (rate limit) que load_VP_data.
     """
     region_geometry = mapping(_AFE_REGION_POLY)
 
-    if isinstance(flags, list):
-        flag_filter = "flag IN (" + ", ".join(["'{}'".format(f) for f in flags]) + ")"
-    else:
-        flag_filter = f"flag = '{flags}'"
+    api_filters = ["distance_from_port_km > 3"]
 
-    api_filters = [flag_filter, "distance_from_port_km > 3"]
+    if flags:
+        if isinstance(flags, list) and len(flags) > 1:
+            api_filters.append("flag IN (" + ", ".join(f"'{f}'" for f in flags) + ")")
+        elif isinstance(flags, list) and flags:
+            api_filters.append(f"flag = '{flags[0]}'")
+        elif isinstance(flags, str):
+            api_filters.append(f"flag = '{flags}'")
+
+    if vessel_types:
+        if len(vessel_types) == 1:
+            api_filters.append(f"vessel_type = '{vessel_types[0].lower()}'")
+        else:
+            vt = ", ".join(f"'{t.lower()}'" for t in vessel_types)
+            api_filters.append(f"vessel_type IN ({vt})")
+
+    if vessel_ids:
+        if isinstance(vessel_ids, str):
+            vessel_ids = [vessel_ids]
+        if len(vessel_ids) == 1:
+            api_filters.append(f"vessel_id = '{vessel_ids[0]}'")
+        else:
+            vids = ", ".join(f"'{v}'" for v in vessel_ids)
+            api_filters.append(f"vessel_id IN ({vids})")
 
     for attempt in range(max_retries):
         try:
@@ -297,7 +337,7 @@ async def load_AFE_data(flags, start, end, client, max_retries=10):
     df = report.df()
     if df.empty:
         return df
-    if "vessel_type" in df.columns:
+    if "vessel_type" in df.columns and not vessel_ids:
         df = df[df["vessel_type"] == "FISHING"]
     return df
 
@@ -325,3 +365,33 @@ async def bulk_load_afe_to_csv(flags, start_date, end_date, client, csv_path,
     df = pd.concat(all_months, ignore_index=True)
     df.to_csv(csv_path, index=False)
     return csv_path
+
+
+async def bulk_load_afe_dataframe(flags, start_date, end_date, client,
+                                  vessel_types=None, vessel_ids=None,
+                                  progress_callback=None):
+    """
+    Comme bulk_load_afe_to_csv, mais renvoie directement un DataFrame
+    concaténé en mémoire (pas d'écriture sur disque) -- utilisé par la
+    heatmap AFE (single vessel ou filtrée par flag(s)/type(s)), qui n'a
+    besoin que des positions lat/lon, pas d'un fichier CSV persistant.
+
+    flags peut être None (pas de filtre pavillon), utile en mode single
+    vessel où seul vessel_ids importe.
+    """
+    chunks = get_monthly_chunks(start_date, end_date)
+    all_months = []
+
+    for i, (start, end) in enumerate(chunks):
+        if progress_callback:
+            progress_callback(f"AFE {start} -> {end}...", (i + 1) / max(len(chunks), 1))
+        df_month = await load_AFE_data(flags, start, end, client,
+                                        vessel_types=vessel_types, vessel_ids=vessel_ids)
+        if df_month is not None and not df_month.empty:
+            all_months.append(df_month)
+        if i < len(chunks) - 1:
+            await asyncio.sleep(3)
+
+    if not all_months:
+        return pd.DataFrame()
+    return pd.concat(all_months, ignore_index=True)

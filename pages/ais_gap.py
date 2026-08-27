@@ -68,7 +68,26 @@ def do_ais_gaps_bulk(flags, vessel_types, gear_types, start, end, api_key):
     return df if df is not None else pd.DataFrame()
 
 
-def _group_results_by_mmsi(df):
+def _clean_identity_value(value):
+    if pd.isna(value):
+        return None
+    text = str(value).strip()
+    if not text or text.lower() == "nan":
+        return None
+    if text.endswith(".0") and text[:-2].isdigit():
+        return text[:-2]
+    return text
+
+
+def _identity_key(row):
+    for field in ("imo", "mmsi", "vessel_id"):
+        value = _clean_identity_value(row.get(field))
+        if value:
+            return f"{field}:{value}"
+    return None
+
+
+def _group_results_by_identity(df):
     """Renvoie une liste d'entrees {label, ids, name, owner, mmsi, imo, ...}."""
     entries = []
     if df is None or df.empty:
@@ -76,18 +95,14 @@ def _group_results_by_mmsi(df):
     if "to" in df.columns:
         df = df.sort_values("to", ascending=False)
 
-    seen = set()
-    for _, row in df.iterrows():
-        vid = row.get("vessel_id")
-        mmsi = row.get("mmsi")
-        if pd.isnull(vid) or pd.isnull(mmsi):
-            continue
-        if mmsi in seen:
-            continue
-        seen.add(mmsi)
+    work = df.copy()
+    work["_identity_key"] = work.apply(_identity_key, axis=1)
+    work = work[work["_identity_key"].notna()]
 
-        grp = df[df["mmsi"] == mmsi]
-        ids = grp["vessel_id"].dropna().tolist()
+    for _, grp in work.groupby("_identity_key", sort=False):
+        row = grp.iloc[0]
+        ids = grp["vessel_id"].dropna().astype(str).unique().tolist() if "vessel_id" in grp.columns else []
+        mmsi_values = grp["mmsi"].dropna().astype(str).unique().tolist() if "mmsi" in grp.columns else []
 
         def first_valid(col):
             s = grp[col].dropna() if col in grp.columns else pd.Series(dtype=object)
@@ -96,13 +111,17 @@ def _group_results_by_mmsi(df):
         name = row.get("ship_name") if pd.notnull(row.get("ship_name")) else "Unknown"
         flag = row.get("flag") if pd.notnull(row.get("flag")) else "?"
         owner = row.get("owner") if pd.notnull(row.get("owner")) else "Owner unknown"
-        label = f"{name} | MMSI {mmsi} | {flag} | Owner: {owner}"
+        imo = first_valid("imo")
+        mmsi = ", ".join(mmsi_values) if mmsi_values else "?"
+        label = f"{name} | IMO {imo or '?'} | MMSI {mmsi} | {flag} | Owner: {owner}"
         entries.append({
             "label": label, "ids": ids, "name": name, "owner": owner,
-            "mmsi": mmsi, "imo": first_valid("imo"),
+            "mmsi": mmsi_values[0] if mmsi_values else None, "mmsi_values": mmsi_values,
+            "imo": imo,
             "vessel_type": first_valid("vessel_type"),
             "gear_type": first_valid("gear_type"),
             "length_m": first_valid("length_m"),
+            "call_sign": first_valid("call_sign"),
         })
     return entries
 
@@ -292,7 +311,7 @@ def register_callbacks(app):
         except Exception as e:
             return [], None, None, "Search failed: " + str(e)[:70]
 
-        entries = _group_results_by_mmsi(df)
+        entries = _group_results_by_identity(df)
         if not entries:
             return [], None, None, "No vessel found."
         opts = [{"label": e["label"], "value": str(i)} for i, e in enumerate(entries)]

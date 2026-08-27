@@ -41,7 +41,34 @@ from dash import dcc, html, Input, Output, State, dash_table
 
 from shared import BG, PANEL, BDR, DIM, MAIN, SOFT, ACC, lbl, GFW_DOWNLOAD_DIR
 from config import ROOT, ZONES, FLAG_NAMES
-from gfw import list_downloaded_csvs, load_csv
+from gfw import load_csv
+
+
+def _open_native_csv_dialog(initial_dir):
+    """
+    Opens the OS's native "Open file" dialog (Windows Explorer style,
+    same as any desktop app) restricted to CSV files, and returns the
+    chosen path as a string, or None if the user cancelled.
+
+    Only works when the Dash app is run locally (server and browser on
+    the same machine) since tkinter needs a display on the machine
+    where this code executes.
+    """
+    import tkinter as tk
+    from tkinter import filedialog
+
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    try:
+        path = filedialog.askopenfilename(
+            title="Ouvrir",
+            initialdir=str(initial_dir) if Path(initial_dir).exists() else str(ROOT),
+            filetypes=[("Fichiers CSV", "*.csv"), ("Tous les fichiers", "*.*")],
+        )
+    finally:
+        root.destroy()
+    return path or None
 
 STANDARD_CRS = "EPSG:4326"
 
@@ -200,7 +227,8 @@ def build_vp_report(df, filter_type="All Vessels", buffer_dis=BUFFER_DIS,
     """
     empty_cols = ["Vessel Id", "Vessel Name", "MMSI", "Country",
                   "Gap Hours (outside AIS buffer)", "Total Gap Hours",
-                  "Tracked Activity (Hrs)", "Encounter Events"]
+                  "Tracked Activity (Hrs)", "Encounter Events",
+                  "Risk Score", "Risk Level"]
     if df is None or df.empty or not {"lat", "lon", "vessel_id", "date"}.issubset(df.columns):
         return pd.DataFrame(columns=empty_cols), {}, "No data."
 
@@ -290,6 +318,23 @@ def build_vp_report(df, filter_type="All Vessels", buffer_dis=BUFFER_DIS,
     for c in ["Gap Hours (outside AIS buffer)", "Total Gap Hours", "Tracked Activity (Hrs)"]:
         report[c] = report[c].round(2)
 
+    risk_raw = (
+        report["Gap Hours (outside AIS buffer)"] * 1.5
+        + report["Total Gap Hours"] * 0.5
+        + report["Encounter Events"] * 8
+    )
+    report["Risk Score"] = risk_raw.clip(lower=0, upper=100).round(0).astype(int)
+    report["Risk Level"] = pd.cut(
+        report["Risk Score"],
+        bins=[-1, 34, 69, 100],
+        labels=["Low", "Medium", "High"],
+    ).astype(str)
+    report = report.sort_values([
+        "Risk Score",
+        "Encounter Events",
+        "Gap Hours (outside AIS buffer)",
+    ], ascending=False).reset_index(drop=True)
+
     totals = {
         "Gap Hours (outside AIS buffer)": round(float(report["Gap Hours (outside AIS buffer)"].sum()), 2),
         "Total Gap Hours": round(float(report["Total Gap Hours"].sum()), 2),
@@ -314,13 +359,26 @@ def _panel_style():
             "padding": "1.2rem", "flex": "1", "minWidth": "320px"}
 
 
+def _browse_button_style():
+    return {"width": "100%", "padding": "0.55rem", "background": PANEL,
+            "color": MAIN, "border": f"1px solid {BDR}", "borderRadius": "6px",
+            "cursor": "pointer", "fontWeight": "600", "marginBottom": "0.4rem",
+            "textAlign": "left"}
+
+
+def _selected_file_style():
+    return {"fontSize": "0.75rem", "color": SOFT, "marginBottom": "1rem",
+            "wordBreak": "break-all"}
+
+
 def _classic_layout():
     zones_txt = ", ".join(ZONES[k].get("label", k) for k in REPORT_ZONE_KEYS) or "no zone configured"
-    csv_options = [{"label": f["filename"], "value": f["path"]} for f in list_downloaded_csvs(ROOT / "data")]
 
     return html.Div([
         dcc.Download(id="vp-report-download"),
         dcc.Download(id="afe-report-download"),
+        dcc.Store(id="vp-report-csv"),
+        dcc.Store(id="afe-report-csv"),
 
         html.H5("Reports", style={"color": MAIN, "marginBottom": "0.3rem"}),
         html.P("Build a report from a CSV already downloaded on the Data page. "
@@ -336,9 +394,10 @@ def _classic_layout():
                        style={"fontSize": "0.75rem", "color": DIM, "marginBottom": "1rem"}),
 
                 lbl("Downloaded CSV (Vessel Presence)"),
-                dcc.Dropdown(id="vp-report-csv", options=csv_options, value=None,
-                    placeholder="Choose a CSV...",
-                    style={"color": "#000", "marginBottom": "1rem"}),
+                html.Button([html.Span("📁 "), "Parcourir..."], id="vp-browse-btn",
+                    n_clicks=0, style=_browse_button_style()),
+                html.Div("Aucun fichier selectionne", id="vp-selected-file",
+                    style=_selected_file_style()),
 
                 lbl("Vessel selection"),
                 dcc.Dropdown(id="vp-report-filter", value="All Vessels", clearable=False,
@@ -363,9 +422,10 @@ def _classic_layout():
                        style={"fontSize": "0.75rem", "color": DIM, "marginBottom": "1rem"}),
 
                 lbl("Downloaded CSV (Fishing Effort)"),
-                dcc.Dropdown(id="afe-report-csv", options=csv_options, value=None,
-                    placeholder="Choose a CSV...",
-                    style={"color": "#000", "marginBottom": "1rem"}),
+                html.Button([html.Span("📁 "), "Parcourir..."], id="afe-browse-btn",
+                    n_clicks=0, style=_browse_button_style()),
+                html.Div("Aucun fichier selectionne", id="afe-selected-file",
+                    style=_selected_file_style()),
 
                 html.Button("Generate AFE Report", id="afe-report-run", n_clicks=0,
                     style={"width": "100%", "padding": "0.6rem",
@@ -407,10 +467,16 @@ def layout():
                 labelStyle={"display": "inline-block", "marginRight": "1.5rem",
                             "fontSize": "0.8rem", "color": SOFT, "cursor": "pointer"},
             ),
-        ], style={"padding": "1rem 1.5rem 0 1.5rem", "background": BG}),
+        ], style={"padding": "1rem 1.5rem 0 1.5rem", "background": BG, "flexShrink": "0"}),
 
-        html.Div(id="report-mode-content", children=_classic_layout()),
-    ])
+        # Pas de hauteur figee ici (ni "calc(100vh - Npx)", ni "100%") : la vraie
+        # hauteur de la barre de nav n'est pas fiable a deviner depuis cette page
+        # (elle peut faire 52px ou 140px selon le theme/l'ecran), et une valeur
+        # fausse fait deborder tout le contenu hors de l'ecran. On laisse la page
+        # s'etendre naturellement et le navigateur gerer le defilement vertical.
+        html.Div(id="report-mode-content", children=_classic_layout(),
+                  style={"minWidth": "0"}),
+    ], style={"display": "flex", "flexDirection": "column", "minWidth": "0"})
     if long_df is None or long_df.empty:
         return html.P("No fishing effort found in the configured zones for this CSV.",
                       style={"color": SOFT, "fontSize": "0.85rem"})
@@ -495,6 +561,30 @@ def register_callbacks(app):
         return _classic_layout()
 
     @app.callback(
+        Output("vp-report-csv", "data"),
+        Output("vp-selected-file", "children"),
+        Input("vp-browse-btn", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def _browse_vp_csv(n_clicks):
+        path = _open_native_csv_dialog(ROOT / "data")
+        if not path:
+            raise dash.exceptions.PreventUpdate
+        return path, path
+
+    @app.callback(
+        Output("afe-report-csv", "data"),
+        Output("afe-selected-file", "children"),
+        Input("afe-browse-btn", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def _browse_afe_csv(n_clicks):
+        path = _open_native_csv_dialog(ROOT / "data")
+        if not path:
+            raise dash.exceptions.PreventUpdate
+        return path, path
+
+    @app.callback(
         Output("report-table", "children"),
         Output("afe-report-status", "children"),
         Output("vp-report-status", "children"),
@@ -502,8 +592,8 @@ def register_callbacks(app):
         Output("vp-report-download", "data"),
         Input("afe-report-run", "n_clicks"),
         Input("vp-report-run", "n_clicks"),
-        State("afe-report-csv", "value"),
-        State("vp-report-csv", "value"),
+        State("afe-report-csv", "data"),
+        State("vp-report-csv", "data"),
         State("vp-report-filter", "value"),
         prevent_initial_call=True,
     )

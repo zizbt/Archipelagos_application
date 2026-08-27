@@ -34,6 +34,10 @@ speed) and **port visits**.
 | **Encounters** | Vessel-to-vessel encounters (< 500 m for ≥ 2 h). |
 | **Loitering** | Vessels holding a low speed (adjustable thresholds). |
 | **Port visits** | Port visits via the GFW API, aggregated by port. |
+| **Tracking & Reports** | Vessel-focused report with AIS gaps, port visits, loitering, encounters, and identity-stable search results. |
+| **Watchlist** | Ranks vessels from saved VP reports by risk score so the most suspicious cases stay visible. |
+| **Alerts** | Triage view that filters the watchlist to the highest-risk and repeated vessels first. |
+| **Vessel Dossier** | Detailed per-vessel history across saved VP reports, with strongest signals and occurrence history. |
 
 ---
 

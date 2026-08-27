@@ -183,10 +183,19 @@ def layout():
 
             html.Div(id="vr-status", style={"fontSize": "0.72rem", "color": SOFT}),
 
+        # Pas de hauteur figee / overflowY force ici (ca dependait d'une
+        # hauteur de nav devinee et fausse). "position: sticky" fait rester
+        # la sidebar visible pendant le scroll de la page, sans avoir besoin
+        # de connaitre la hauteur exacte du bandeau au-dessus.
         ], style={"width": "320px", "minWidth": "320px", "padding": "1rem",
                    "background": BG, "borderRight": "1px solid " + BDR,
-                   "height": "calc(100vh - 52px)", "overflowY": "auto", "flexShrink": "0"}),
+                   "flexShrink": "0", "position": "sticky", "top": "0",
+                   "alignSelf": "flex-start", "maxHeight": "100vh", "overflowY": "auto"}),
 
+        # minWidth:0 est essentiel : sans lui, un flex-item refuse de retrecir
+        # en dessous de la largeur de son contenu. Le tableau (beaucoup de
+        # colonnes) forcait donc TOUTE la ligne (sidebar comprise) a deborder
+        # horizontalement au lieu de rester dans son propre scroll interne.
         html.Div([
             html.Div(
                 html.Button("Export full CSV", id="vr-btn-export", n_clicks=0,
@@ -196,7 +205,8 @@ def layout():
                            "fontWeight": "600", "padding": "0.3rem 1rem", "borderRadius": "5px"}),
                 style={"padding": "0.3rem 0.6rem", "background": BG,
                        "borderBottom": "1px solid " + BDR, "flexShrink": "0",
-                       "display": "flex", "justifyContent": "flex-end"},
+                       "display": "flex", "justifyContent": "flex-end", "position": "sticky",
+                       "top": "0", "zIndex": "5"},
             ),
             html.Div(
                 dcc.Loading(type="circle", color=ACC,
@@ -204,21 +214,35 @@ def layout():
                         children=html.P("Search a vessel, select it, choose dates, "
                                         "then click Generate Report.",
                                         style={"color": DIM, "fontSize": "0.8rem"}))),
-                style={"flex": "1", "minHeight": 0, "overflowY": "auto", "padding": "1rem"},
+                style={"padding": "1rem", "minWidth": "0", "overflowX": "auto"},
             ),
-        ], style={"flex": "1", "minHeight": 0, "display": "flex", "flexDirection": "column"}),
+        ], style={"flex": "1", "minWidth": "0", "display": "flex", "flexDirection": "column"}),
 
-    ], style={"display": "flex", "height": "calc(100vh - 52px)"})
+    ], style={"display": "flex", "alignItems": "flex-start"})
 
 
 # ── Rendu du rapport ─────────────────────────────────────────────────────────
 
 def _pick_display_cols(df, extra_keywords=("duration", "distance", "speed", "km", "hour", "confidence")):
     """Choisit un sous-ensemble de colonnes lisibles pour l'affichage,
-    sans presumer des noms exacts au-dela de start/end/lat/lon."""
+    sans presumer des noms exacts au-dela de start/end/lat/lon.
+
+    Exclut les colonnes qui contiennent en realite un blob JSON (ex:
+    "..._distances" est une LISTE de dicts que json_normalize ne peut
+    pas aplatir plus loin ; _sanitize_for_display la convertit en texte
+    JSON tres long, ce qui rend la colonne illisible et fait deborder
+    le tableau horizontalement bien au-dela de l'ecran)."""
     priority = [c for c in ("start", "end", "lat", "lon") if c in df.columns]
-    others = [c for c in df.columns if c not in priority
-              and any(k in c.lower() for k in extra_keywords)]
+    others = []
+    for c in df.columns:
+        if c in priority:
+            continue
+        if not any(k in c.lower() for k in extra_keywords):
+            continue
+        sample = df[c].dropna().astype(str)
+        if not sample.empty and sample.str.len().mean() > 40:
+            continue  # colonne JSON/liste brute -> on ne l'affiche pas
+        others.append(c)
     cols = priority + others
     return cols if cols else list(df.columns)[:8]
 
@@ -244,13 +268,14 @@ def _section_table(key, df, error):
         sort_action="native", filter_action="native", page_size=10,
         style_table={"overflowX": "auto"},
         style_cell={"backgroundColor": BG, "color": SOFT, "border": "1px solid " + BDR,
-                    "fontSize": "0.73rem", "padding": "4px 8px"},
+                    "fontSize": "0.73rem", "padding": "4px 8px",
+                    "maxWidth": "260px", "overflow": "hidden", "textOverflow": "ellipsis"},
         style_header={"backgroundColor": PANEL, "color": MAIN, "fontWeight": "600"},
     )
     return html.Div([
         html.H6(f"{label} ({len(df)})", style={"color": MAIN, "fontSize": "0.85rem", "marginBottom": "0.3rem"}),
         table,
-    ], style={"marginBottom": "1.2rem"})
+    ], style={"marginBottom": "1.2rem", "minWidth": "0"})
 
 
 def _summary_bar(info, start, end, results):
@@ -285,8 +310,9 @@ def _summary_bar(info, start, end, results):
 def _render_report(info, start, end, results):
     return html.Div([
         _summary_bar(info, start, end, results),
-        html.Div([_section_table(key, *results[key]) for key in EVENT_DATASETS]),
-    ])
+        html.Div([_section_table(key, *results[key]) for key in EVENT_DATASETS],
+                 style={"minWidth": "0"}),
+    ], style={"minWidth": "0"})
 
 
 # ── CALLBACKS ────────────────────────────────────────────────────────────────
