@@ -20,6 +20,7 @@ from shared import BG, PANEL, BDR, DIM, MAIN, SOFT, ACC, MAPBOX_KEY, lbl
 from shared import AEGEAN_CENTER
 from config import YEARS, FLAG_NAMES
 from loader import load_trajectories_range
+from port_zones import port_mask_from_xy, PORT_RADIUS_M_DEFAULT, has_ports
 
 TRAJECTORY_COLUMNS = ["lat", "lon", "vessel_id", "ship_name", "date"]
 
@@ -32,14 +33,19 @@ TIME_THRESHOLD_H = 2
 ENC_COLOR = [128, 0, 128, 200]
 
 def get_encounters_dataframe(df, dist_threshold_meters=DIST_THRESHOLD_M,
-                             time_threshold_hours=TIME_THRESHOLD_H):
+                             time_threshold_hours=TIME_THRESHOLD_H,
+                             port_radius_m=PORT_RADIUS_M_DEFAULT):
     """
     Dection of vessel encounters: two vessels within dist_threshold_meters for
     time_threshold_hours or more.
+
+    Each encounter is also flagged with 'in_port' (True/False): whether its
+    midpoint lies within port_radius_m of a known port/harbour point
+    (see ports.py). This lets the UI filter "at sea only" / "in port only".
     """
     empty_cols = ['vessel_1', 'vessel_2', 'vessel_1_id', 'vessel_2_id',
                   'start', 'end', 'duration_hours', 'n_points',
-                  'median_distance_m', 'reliability', 'lat', 'lon']
+                  'median_distance_m', 'reliability', 'lat', 'lon', 'in_port']
 
     if df is None or df.empty or 'vessel_id' not in df.columns:
         return pd.DataFrame(columns=empty_cols)
@@ -154,6 +160,8 @@ def get_encounters_dataframe(df, dist_threshold_meters=DIST_THRESHOLD_M,
     agg["lon"] = pts.x.round(5).values
     agg["duration_hours"] = agg["duration_hours"].round(2)
     agg["median_distance_m"] = agg["median_distance_m"].round(1)
+    agg["in_port"] = port_mask_from_xy(agg["x_mid"].values, agg["y_mid"].values,
+                                       radius_m=port_radius_m)
 
     return agg[empty_cols].sort_values("start").reset_index(drop=True)
 
@@ -187,6 +195,34 @@ def layout():
             html.P("Tip: keep the range short (days/weeks). Encounter detection is heavy.",
                    style={"fontSize": "0.68rem", "color": DIM, "fontStyle": "italic",
                           "marginBottom": "0.6rem"}),
+
+            lbl("Location"),
+            html.P("No port reference file found (data/gis/ITA_vessels.geojson) "
+                   "-- filter disabled.",
+                   style={"fontSize": "0.68rem", "color": DIM, "fontStyle": "italic",
+                          "marginBottom": "0.4rem", "display": "block" if not has_ports() else "none"}),
+            dcc.RadioItems(
+                id="enc-port-filter",
+                options=[
+                    {"label": " Sea + Port", "value": "both"},
+                    {"label": " At sea only", "value": "sea"},
+                    {"label": " In port only", "value": "port"},
+                ],
+                value="both",
+                labelStyle={"display": "block", "fontSize": "0.75rem",
+                            "color": SOFT, "cursor": "pointer", "marginBottom": "0.15rem"},
+                style={"marginBottom": "0.6rem",
+                       "display": "block" if has_ports() else "none"},
+            ),
+
+            html.Div([
+                lbl("Port radius (m)"),
+                dcc.Slider(id="enc-port-radius", min=200, max=3000, step=100,
+                    value=PORT_RADIUS_M_DEFAULT,
+                    marks={200: "200", 1500: "1500", 3000: "3000"},
+                    tooltip={"placement": "bottom", "always_visible": False}),
+            ], style={"marginBottom": "1rem",
+                      "display": "block" if has_ports() else "none"}),
 
             html.Button("Analyze", id="enc-btn-run", n_clicks=0,
                 style={"width": "100%", "padding": "0.5rem",
@@ -245,6 +281,7 @@ def _build_map(enc_df):
         plot["dur"] = plot["duration_hours"].astype(str)
         plot["dist"] = plot["median_distance_m"].astype(str)
         plot["rel"] = plot["reliability"].astype(str)
+        plot["loc"] = np.where(plot["in_port"], "In port", "At sea")
         plot["radius"] = plot["duration_hours"].clip(lower=1) * 200
 
         layers.append(pdk.Layer(
@@ -282,6 +319,7 @@ def _click_panel(obj):
         html.Div(f"Duration: {obj.get('dur', '-')} h"),
         html.Div(f"Median distance: {obj.get('dist', '-')} m"),
         html.Div(f"Reliability: {obj.get('rel', '-')}"),
+        html.Div(f"Location: {obj.get('loc', '-')}"),
     ])
     return body, {"position": "absolute", "top": "0.6rem", "left": "0.6rem",
                   "maxWidth": "280px", "background": "rgba(26,13,42,0.95)",
@@ -311,9 +349,11 @@ def register_callbacks(app):
         Input("enc-btn-run", "n_clicks"),
         State("enc-start", "date"),
         State("enc-end", "date"),
+        State("enc-port-filter", "value"),
+        State("enc-port-radius", "value"),
         prevent_initial_call=True,
     )
-    def _run(n, start, end):
+    def _run(n, start, end, port_filter, port_radius):
         if not n:
             raise dash.exceptions.PreventUpdate
 
@@ -321,9 +361,14 @@ def register_callbacks(app):
         if df is None or df.empty:
             return _build_map(None), "No trajectory data for this range.", None
 
-        enc = get_encounters_dataframe(df)
+        enc = get_encounters_dataframe(df, port_radius_m=port_radius or PORT_RADIUS_M_DEFAULT)
+
+        if not enc.empty and port_filter in ("sea", "port"):
+            enc = enc[enc["in_port"] == (port_filter == "port")]
+
+        loc_txt = {"sea": " (at sea only)", "port": " (in port only)"}.get(port_filter, "")
         summary = (f"{len(enc)} encounter(s) found "
-                   f"({start} -> {end}).") if not enc.empty else "No encounter found."
+                   f"({start} -> {end}){loc_txt}.") if not enc.empty else "No encounter found."
         store = enc.assign(start=enc["start"].astype(str),
                            end=enc["end"].astype(str)).to_dict("records") if not enc.empty else None
         return _build_map(enc), summary, store

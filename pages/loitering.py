@@ -19,6 +19,7 @@ from dash import dcc, html, Input, Output, State, dash_table
 from shared import BG, PANEL, BDR, DIM, MAIN, SOFT, ACC, MAPBOX_KEY, lbl, AEGEAN_CENTER
 from config import YEARS
 from loader import load_trajectories_range
+from port_zones import port_mask_from_xy, PORT_RADIUS_M_DEFAULT, has_ports
 
 TRAJECTORY_COLUMNS = ["lat", "lon", "vessel_id", "ship_name", "date"]
 
@@ -32,17 +33,22 @@ LOITER_COLOR = [255, 140, 0, 170]
 
 # CALCUL DU LOITERING
 def get_loitering_dataframe(df, speed_threshold_knots=DEFAULT_SPEED,
-                            min_duration_hours=DEFAULT_DURATION):
+                            min_duration_hours=DEFAULT_DURATION,
+                            port_radius_m=PORT_RADIUS_M_DEFAULT):
     """
     Detecte les segments ou un navire reste sous un seuil de vitesse pendant
     au moins min_duration_hours. Version vectorisee (pas de double boucle).
 
     Filtre "en mer" : on ecarte les evenements de rayon quasi nul, qui
     correspondent a des navires immobiles a quai (vitesse ~0 en continu).
+
+    Chaque evenement est aussi marque 'in_port' (True/False) : son centroide
+    se trouve-t-il a moins de port_radius_m d'un point de port connu
+    (voir ports.py) ? Permet au filtre UI "in port only" / "at sea only".
     """
     empty_cols = ['vessel_id', 'ship_name', 'start', 'end', 'duration_hours',
                   'avg_speed_knots', 'n_points', 'centroid_lat', 'centroid_lon',
-                  'max_radius_m']
+                  'max_radius_m', 'in_port']
     MIN_RADIUS_M = 100.0
 
     if df is None or df.empty or 'vessel_id' not in df.columns:
@@ -114,6 +120,8 @@ def get_loitering_dataframe(df, speed_threshold_knots=DEFAULT_SPEED,
     agg['duration_hours'] = agg['duration_hours'].round(2)
     agg['avg_speed_knots'] = agg['avg_speed_knots'].round(2)
     agg['max_radius_m'] = agg['max_radius_m'].round(1)
+    agg['in_port'] = port_mask_from_xy(agg['cx'].values, agg['cy'].values,
+                                       radius_m=port_radius_m)
 
     return agg[empty_cols].sort_values('start').reset_index(drop=True)
 
@@ -159,6 +167,34 @@ def layout():
                     marks={1: "1", 6: "6", 12: "12"},
                     tooltip={"placement": "bottom", "always_visible": False}),
             ], style={"marginBottom": "1rem"}),
+
+            lbl("Location"),
+            html.P("No port reference file found (data/gis/ITA_vessels.geojson) "
+                   "-- filter disabled.",
+                   style={"fontSize": "0.68rem", "color": DIM, "fontStyle": "italic",
+                          "marginBottom": "0.4rem", "display": "block" if not has_ports() else "none"}),
+            dcc.RadioItems(
+                id="loi-port-filter",
+                options=[
+                    {"label": " Sea + Port", "value": "both"},
+                    {"label": " At sea only", "value": "sea"},
+                    {"label": " In port only", "value": "port"},
+                ],
+                value="both",
+                labelStyle={"display": "block", "fontSize": "0.75rem",
+                            "color": SOFT, "cursor": "pointer", "marginBottom": "0.15rem"},
+                style={"marginBottom": "0.6rem",
+                       "display": "block" if has_ports() else "none"},
+            ),
+
+            html.Div([
+                lbl("Port radius (m)"),
+                dcc.Slider(id="loi-port-radius", min=200, max=3000, step=100,
+                    value=PORT_RADIUS_M_DEFAULT,
+                    marks={200: "200", 1500: "1500", 3000: "3000"},
+                    tooltip={"placement": "bottom", "always_visible": False}),
+            ], style={"marginBottom": "1rem",
+                      "display": "block" if has_ports() else "none"}),
 
             html.Button("Analyze", id="loi-btn-run", n_clicks=0,
                 style={"width": "100%", "padding": "0.5rem",
@@ -218,6 +254,7 @@ def _build_map(loi_df):
         plot["spd"] = plot["avg_speed_knots"].astype(str)
         plot["npt"] = plot["n_points"].astype(str)
         plot["rad"] = plot["max_radius_m"].astype(str)
+        plot["loc"] = np.where(plot["in_port"], "In port", "At sea")
         plot["radius"] = plot["max_radius_m"].clip(lower=200)
 
         layers.append(pdk.Layer(
@@ -254,6 +291,7 @@ def _click_panel(obj):
         html.Div(f"Avg speed: {obj.get('spd', '-')} kn"),
         html.Div(f"Points: {obj.get('npt', '-')}"),
         html.Div(f"Max radius: {obj.get('rad', '-')} m"),
+        html.Div(f"Location: {obj.get('loc', '-')}"),
     ])
     return body, {"position": "absolute", "top": "0.6rem", "left": "0.6rem",
                   "maxWidth": "280px", "background": "rgba(40,24,0,0.95)",
@@ -285,9 +323,11 @@ def register_callbacks(app):
         State("loi-end", "date"),
         State("loi-speed", "value"),
         State("loi-duration", "value"),
+        State("loi-port-filter", "value"),
+        State("loi-port-radius", "value"),
         prevent_initial_call=True,
     )
-    def _run(n, start, end, speed, duration):
+    def _run(n, start, end, speed, duration, port_filter, port_radius):
         if not n:
             raise dash.exceptions.PreventUpdate
 
@@ -296,9 +336,15 @@ def register_callbacks(app):
             return _build_map(None), "No trajectory data for this range.", None
 
         loi = get_loitering_dataframe(df, speed_threshold_knots=float(speed),
-                                      min_duration_hours=float(duration))
+                                      min_duration_hours=float(duration),
+                                      port_radius_m=port_radius or PORT_RADIUS_M_DEFAULT)
+
+        if not loi.empty and port_filter in ("sea", "port"):
+            loi = loi[loi["in_port"] == (port_filter == "port")]
+
+        loc_txt = {"sea": " (at sea only)", "port": " (in port only)"}.get(port_filter, "")
         summary = (f"{len(loi)} loitering event(s) "
-                   f"(<= {speed} kn, >= {duration} h).") if not loi.empty else "No loitering found."
+                   f"(<= {speed} kn, >= {duration} h){loc_txt}.") if not loi.empty else "No loitering found."
         store = (loi.assign(start=loi["start"].astype(str), end=loi["end"].astype(str))
                  .to_dict("records")) if not loi.empty else None
         return _build_map(loi), summary, store
