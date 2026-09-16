@@ -1,16 +1,23 @@
 """
 pages/alerts.py
 ================
-Alert page -- computes suspicious-vessel alerts LIVE from the precomputed
-trajectories over a chosen date range. No dependency on saved report
-files (those can be deleted at any time, which made the old
-watchlist/alerts/dossier trio built on top of them unreliable).
+Alert page -- computes suspicious-vessel alerts LIVE from an imported CSV
+of AIS positions. No dependency on saved report files (those can be
+deleted at any time, which made the old watchlist/alerts/dossier trio
+built on top of them unreliable).
+
+v2 -- SINGLE data source now: an imported CSV, exactly like
+pages/heatmap.py (drag & drop + server-side cache). No more precomputed
+trajectories (load_trajectories_range) and no more date-range filter --
+the whole imported CSV is analyzed as-is; AFE's own start/end window is
+simply derived from the min/max of the CSV's own "date" column (see
+compute_alerts).
 
 Signals combined per vessel:
   1. AIS gaps (>3h)   -- reconstructed CLIENT-SIDE from raw hourly
                           AIS-presence pings (gfw.bulk_load_client_gap_events_dataframe),
                           same method as pages/ais_gap.py, for every
-                          vessel present in the trajectory selection.
+                          vessel present in the imported CSV.
                           Each gap over the threshold is classified via
                           the AIS coverage buffer (gfw.classify_gap_status,
                           shared with ais_gap.py): only "suspicious"
@@ -24,29 +31,6 @@ Signals combined per vessel:
                           the single biggest score contributor. Degrades
                           to "no alerts" (+ a warning) if no API key is
                           saved, since the gate itself now needs GFW.
-                          HISTORY (why not simpler alternatives):
-                          - A first version reconstructed gaps by diffing
-                            consecutive rows of the precomputed trajectory
-                            dataset. That was badly wrong: the trajectory
-                            dataset only carries ~1 position/day/vessel,
-                            so every day-to-day diff was naturally ~24h --
-                            comfortably over the 3h threshold -- which
-                            flagged an AIS "blackout" on every single day
-                            for every vessel, real or not (giveaway:
-                            totals landing right around 365*24=8760h).
-                          - A second version switched to GFW's official
-                            "public-global-gaps-events" dataset (same one
-                            ais_gap.py used at the time). That dataset
-                            only publishes gaps starting >= 50 nautical
-                            miles from shore (GFW's own methodology) --
-                            structurally excludes almost the whole Aegean
-                            archipelago, so it returned 0 gaps for every
-                            Greek vessel tested. Not a bug, just the wrong
-                            dataset for a coastal fleet.
-                          - This version reconstructs from raw pings
-                            instead (no distance-from-shore cutoff), with
-                            the buffer classification above to separate
-                            real offshore silence from coastal noise.
   2. AFE (fishing hrs) -- Apparent Fishing Effort, fetched live from GFW
                           for the (small) set of vessels that passed the
                           AIS-gap gate. Second-biggest score contributor.
@@ -65,17 +49,17 @@ every vessel.
 """
 
 import asyncio
+import base64
+import io
 import threading
 import uuid
-from datetime import date
 
 import dash
 import pandas as pd
 from dash import dcc, html, Input, Output, State, dash_table
 
 from shared import BG, PANEL, BDR, DIM, MAIN, SOFT, ACC, lbl, FLAG_OPTIONS
-from config import YEARS, FLAG_NAMES, VESSEL_TYPES
-from loader import load_trajectories_range
+from config import FLAG_NAMES, VESSEL_TYPES
 from pages.loitering import get_loitering_dataframe
 from pages.encounter import get_encounters_dataframe
 from api_key import get_api_key
@@ -85,13 +69,14 @@ from gfw import (get_gfw_client, bulk_load_afe_dataframe,
 from port_zones import PORT_RADIUS_M_DEFAULT, has_ports
 from zone_filters import get_zone_options, zone_mask, has_any_zone_data
 
-TRAJECTORY_COLUMNS = ["lat", "lon", "vessel_id", "ship_name", "date", "flag", "vessel_type", "gear_type"]
-
-GLOBAL_MIN_DATE = date(YEARS[0], 1, 1)
-GLOBAL_MAX_DATE = date(YEARS[-1], 12, 31)
-
 GAP_THRESHOLD_HOURS = 3  # any gap longer than this counts as an AIS blackout
 DEFAULT_BUFFER_NM = 3    # AIS coverage buffer distance -- must match pages/ais_gap.py's
+
+PLACEHOLDER_STYLE = {"color": DIM, "padding": "2rem", "fontSize": "0.85rem", "fontStyle": "italic"}
+
+# Cache serveur du CSV importé, comme _CSV_CACHE dans pages/heatmap.py --
+# évite l'aller-retour du dataframe par le navigateur.
+_CSV_CACHE = {"df": None, "filename": None}
 
 # ── Background-run progress tracking ────────────────────────────────────────
 # Same fix/rationale as pages/ais_gap.py::_RUN_STATE: computing alerts calls
@@ -114,30 +99,36 @@ def _get_run_state(run_id):
         return dict(_RUN_STATE.get(run_id, {}))
 
 
-def _load_trajectories(start, end, vessel_types, flags, gear_types):
+def _parse_uploaded_csv(contents, filename):
+    """Identique à heatmap._parse_uploaded_csv (dcc.Upload -> DataFrame)."""
+    if contents is None:
+        return None
+    _, content_string = contents.split(",", 1)
+    decoded = base64.b64decode(content_string)
+    if filename and filename.lower().endswith((".tsv", ".txt")):
+        return pd.read_csv(io.BytesIO(decoded), sep=None, engine="python")
+    return pd.read_csv(io.BytesIO(decoded))
+
+
+def _filter_uploaded(df, vessel_types, flags, gear_types):
     """
-    Loads precomputed trajectories, filtered by vessel type / flag at load
-    time (cheap -- handled by the loader itself). Gear type isn't
-    necessarily present on every precomputed dataset, so it's applied as a
-    post-filter here with a graceful fallback if the column is missing.
-    Returns (df, warning_or_None).
+    Applique les filtres flag / vessel type / gear type sur le CSV importé
+    (post-filtre, cote client -- il n'y a plus de chargement precompute
+    avec filtre applique a la lecture). Retourne (df, warning_or_None).
     """
-    try:
-        df = load_trajectories_range(start, end, vessel_types or None, flags or None,
-                                     columns=TRAJECTORY_COLUMNS)
-        gear_available = True
-    except Exception:
-        fallback_cols = [c for c in TRAJECTORY_COLUMNS if c != "gear_type"]
-        df = load_trajectories_range(start, end, vessel_types or None, flags or None,
-                                     columns=fallback_cols)
-        gear_available = False
+    if df is None or df.empty:
+        return df, None
 
     warning = None
+    if flags and "flag" in df.columns:
+        df = df[df["flag"].isin(flags)]
+    if vessel_types and "vessel_type" in df.columns:
+        df = df[df["vessel_type"].isin(vessel_types)]
     if gear_types:
-        if gear_available and df is not None and not df.empty and "gear_type" in df.columns:
+        if "gear_type" in df.columns:
             df = df[df["gear_type"].isin(gear_types)]
         else:
-            warning = "Gear type filter skipped: not available in this trajectory dataset."
+            warning = "Gear type filter skipped: not available in this CSV."
     return df, warning
 
 
@@ -205,9 +196,9 @@ def _level_color(level):
 # ---------------------------------------------------------------------------
 # AIS gaps -- reconstructed client-side from raw hourly AIS-presence pings
 # (same method as pages/ais_gap.py), then classified suspicious/normal
-# via the AIS coverage buffer. Runs for EVERY vessel in the trajectory
-# selection, not just an already-gated subset, because AIS gaps are
-# themselves the gate -- there's no cheaper signal to filter on first.
+# via the AIS coverage buffer. Runs for EVERY vessel in the imported CSV,
+# not just an already-gated subset, because AIS gaps are themselves the
+# gate -- there's no cheaper signal to filter on first.
 # Heavier than a plain events-API call (downloads raw position pings,
 # month-by-month) -- expect this to be noticeably slower on a large
 # vessel set or a long date range.
@@ -434,6 +425,10 @@ def compute_alerts(df, speed_threshold=1.5, loiter_duration=2.0,
     outside the AIS coverage buffer) over the period are considered --
     see _fetch_gap_stats.
 
+    afe_start/afe_end: if not given, derived from the min/max of df's own
+    "date" column -- there is no interactive date-range filter on this
+    page, the whole imported CSV is analyzed as-is.
+
     exclude_port_events: if True (default), loitering / encounter events
     that happen within port_radius_m of a known port point (see
     port_zones.py) don't contribute to the score -- a vessel idling or
@@ -459,6 +454,8 @@ def compute_alerts(df, speed_threshold=1.5, loiter_duration=2.0,
     d = df.copy()
     d["date"] = pd.to_datetime(d["date"], errors="coerce")
     d = d.dropna(subset=["lat", "lon", "date", "vessel_id"]).sort_values(["vessel_id", "date"])
+    if d.empty:
+        return pd.DataFrame(columns=empty_cols), None
 
     # Vessel name / flag lookup + a rough position (mean lat/lon) to place
     # each vessel on the summary map.
@@ -471,8 +468,8 @@ def compute_alerts(df, speed_threshold=1.5, loiter_duration=2.0,
 
     # --- Signal 1 (gate + top weight): AIS gaps (blackouts) --------------------
     # Live call to GFW's official gap-events dataset, for every vessel in
-    # the current trajectory selection -- see _fetch_gap_stats docstring
-    # and the module docstring for why this replaced the old local diff.
+    # the imported CSV -- see _fetch_gap_stats docstring and the module
+    # docstring for why this replaced the old local diff.
     all_vessel_ids = d["vessel_id"].dropna().unique().tolist()
     flags_by_vessel = flag_lookup.to_dict() if not flag_lookup.empty else {}
     progress(f"Fetching AIS gaps for {len(all_vessel_ids)} vessel(s)...", 0.0)
@@ -580,6 +577,24 @@ def compute_alerts(df, speed_threshold=1.5, loiter_duration=2.0,
     return result, afe_warning
 
 
+def _upload_zone():
+    return dcc.Upload(
+        id="alerts-csv-upload",
+        children=html.Div([
+            "Drag a CSV here, or ",
+            html.A("browse", style={"color": ACC, "textDecoration": "underline"}),
+        ]),
+        style={
+            "width": "100%", "padding": "1rem 0.5rem",
+            "textAlign": "center", "cursor": "pointer",
+            "border": f"1px dashed {BDR}", "borderRadius": "6px",
+            "color": SOFT, "fontSize": "0.75rem",
+            "marginBottom": "0.5rem",
+        },
+        multiple=False,
+    )
+
+
 # ---------------------------------------------------------------------------
 # LAYOUT
 # ---------------------------------------------------------------------------
@@ -587,6 +602,7 @@ def layout():
     return html.Div([
         dcc.Store(id="alerts-store", data=None),
         dcc.Store(id="alerts-run-id", data=None),
+        dcc.Store(id="alerts-csv-loaded", data=None),
         dcc.Interval(id="alerts-progress-interval", interval=1500, disabled=True),
         dcc.Download(id="alerts-download-csv"),
 
@@ -596,21 +612,17 @@ def layout():
                    "AFE (fishing hours), loitering, and encounters refine the score.",
                    style={"fontSize": "0.7rem", "color": DIM, "marginBottom": "1rem"}),
 
-            lbl("Jump to a year (optional)"),
-            dcc.Dropdown(id="alerts-year", value=None, clearable=True,
-                options=[{"label": str(y), "value": y} for y in YEARS],
-                placeholder="Jump to a year...",
-                style={"color": "#000", "marginBottom": "0.6rem"}),
-            lbl("Start date"),
-            dcc.DatePickerSingle(id="alerts-start", date=date(YEARS[-1], 1, 1),
-                display_format="YYYY-MM-DD",
-                min_date_allowed=GLOBAL_MIN_DATE, max_date_allowed=GLOBAL_MAX_DATE,
-                style={"marginBottom": "0.6rem"}),
-            lbl("End date"),
-            dcc.DatePickerSingle(id="alerts-end", date=date(YEARS[-1], 1, 31),
-                display_format="YYYY-MM-DD",
-                min_date_allowed=GLOBAL_MIN_DATE, max_date_allowed=GLOBAL_MAX_DATE,
-                style={"marginBottom": "1rem"}),
+            html.Div([
+                html.H6("Import a CSV", style={"color": MAIN, "fontSize": "0.82rem", "marginBottom": "0.4rem"}),
+                _upload_zone(),
+                html.Div("No file selected", id="alerts-csv-filename",
+                          style={"fontSize": "0.72rem", "color": DIM,
+                                 "fontStyle": "italic", "marginBottom": "0.6rem"}),
+                html.P("The whole imported file is analyzed -- there's no date-range filter here.",
+                       style={"fontSize": "0.68rem", "color": DIM, "fontStyle": "italic",
+                              "marginBottom": "0.4rem"}),
+            ], style={"marginBottom": "1.2rem", "paddingBottom": "1.2rem",
+                       "borderBottom": f"1px solid {BDR}"}),
 
             lbl("Flag (country)"),
             dcc.Dropdown(id="alerts-flag-filter", options=FLAG_OPTIONS, value=[], multi=True,
@@ -673,8 +685,8 @@ def layout():
                        "borderRadius": "5px", "border": f"1px solid {BDR}",
                        "background": PANEL, "color": MAIN}),
 
-            html.P("Tip: keep the range short (days/weeks). This runs AIS-gap + AFE + "
-                   "loitering + encounter detection together, which is heavy.",
+            html.P("Tip: keep the imported CSV reasonably sized. This runs AIS-gap + "
+                   "AFE + loitering + encounter detection together, which is heavy.",
                    style={"fontSize": "0.68rem", "color": DIM, "fontStyle": "italic",
                           "marginBottom": "0.6rem"}),
 
@@ -698,7 +710,8 @@ def layout():
                    "alignSelf": "flex-start", "maxHeight": "100vh", "overflowY": "auto"}),
 
         html.Div([
-            dcc.Loading(children=html.Div(id="alerts-table")),
+            dcc.Loading(children=html.Div(id="alerts-table",
+                children=html.P("Import a CSV, then click \"Analyze\".", style=PLACEHOLDER_STYLE))),
         ], style={"flex": "1", "minWidth": "0", "minHeight": 0, "overflowY": "auto",
                    "padding": "1rem", "background": BG}),
 
@@ -710,7 +723,7 @@ def layout():
 # ---------------------------------------------------------------------------
 def _table(alerts_df):
     if alerts_df is None or alerts_df.empty:
-        return html.P("No alerts for this period.", style={"color": SOFT, "fontSize": "0.8rem"})
+        return html.P("No alerts for this selection.", style={"color": SOFT, "fontSize": "0.8rem"})
     show = alerts_df.copy()
     show["Flag"] = show["flag"].apply(lambda f: FLAG_NAMES.get(f, f))
     show = show.rename(columns={
@@ -762,60 +775,78 @@ def _apply_filters(df, level_filter, search_text):
 # ---------------------------------------------------------------------------
 def register_callbacks(app):
 
+    # Parse le CSV dès qu'il est déposé -- juste mis en cache serveur, le
+    # calcul des alertes n'a lieu qu'au clic sur "Analyze", plus bas.
     @app.callback(
-        Output("alerts-start", "date"),
-        Output("alerts-end", "date"),
-        Input("alerts-year", "value"),
+        Output("alerts-csv-filename", "children"),
+        Output("alerts-csv-loaded", "data"),
+        Input("alerts-csv-upload", "contents"),
+        State("alerts-csv-upload", "filename"),
         prevent_initial_call=True,
     )
-    def _jump_year(year):
-        if not year:
+    def _on_csv_uploaded(contents, filename):
+        if not contents:
             raise dash.exceptions.PreventUpdate
-        return date(year, 1, 1), date(year, 1, 31)
+        try:
+            df = _parse_uploaded_csv(contents, filename)
+        except Exception as e:
+            _CSV_CACHE["df"] = None
+            return f"Error: {e}", None
 
-    def _background_alerts_run(run_id, start, end, flag_filter, vessel_type_filter,
+        required = {"lat", "lon", "vessel_id", "date"}
+        if not required.issubset(df.columns):
+            _CSV_CACHE["df"] = None
+            missing = ", ".join(sorted(required - set(df.columns)))
+            return f'"{filename}" is missing required column(s): {missing}.', None
+
+        _CSV_CACHE["df"] = df
+        _CSV_CACHE["filename"] = filename
+        return f"Loaded: {len(df):,} rows from \"{filename}\"", "loaded"
+
+    def _background_alerts_run(run_id, df, flag_filter, vessel_type_filter,
                                 gear_type_filter, zone_filter, exclude_port, port_radius):
         """
-        Runs the actual (potentially long) trajectory load + alert
-        computation off the Dash request thread, writing progress and the
-        final result into _RUN_STATE[run_id] as it goes. Mirrors exactly
-        what the old synchronous _run callback did for the button-click
-        path -- only the execution/reporting model changed.
+        Runs the actual (potentially long) alert computation off the Dash
+        request thread, writing progress and the final result into
+        _RUN_STATE[run_id] as it goes. df is a snapshot of the imported
+        CSV taken at launch time (see _launch_run), so a re-upload mid-run
+        can't change the data out from under this thread.
         """
         try:
             def progress(message, fraction):
                 _set_run_state(run_id, status="running", message=message, fraction=fraction)
 
-            progress("Loading trajectories...", 0.0)
-            df, gear_warning = _load_trajectories(start, end, vessel_type_filter,
-                                                  flag_filter, gear_type_filter)
+            progress("Applying filters...", 0.0)
+            df, gear_warning = _filter_uploaded(df, vessel_type_filter, flag_filter, gear_type_filter)
             if df is None or df.empty:
-                msg = "No trajectory data for this range/filter."
+                msg = "No rows left after flag/type/gear filter."
                 if gear_warning:
                     msg += f" ({gear_warning})"
                 _set_run_state(run_id, status="done", alerts=None, summary=msg)
                 return
 
-            progress("Applying zone filter...", 0.0)
             df, zone_warning = _apply_zone_filter(df, zone_filter)
             if df is None or df.empty:
-                msg = "No trajectory data left after zone filter."
+                msg = "No rows left after zone filter."
                 if zone_warning:
                     msg += f" ({zone_warning})"
                 _set_run_state(run_id, status="done", alerts=None, summary=msg)
                 return
 
+            date_col = pd.to_datetime(df["date"], errors="coerce") if "date" in df.columns else None
+            period_txt = (f"{date_col.min():%Y-%m-%d} -> {date_col.max():%Y-%m-%d}"
+                          if date_col is not None and date_col.notna().any() else "N/A")
+
             alerts, afe_warning = compute_alerts(
-                df, afe_start=start[:10], afe_end=end[:10],
-                exclude_port_events=bool(exclude_port),
+                df, exclude_port_events=bool(exclude_port),
                 port_radius_m=port_radius or PORT_RADIUS_M_DEFAULT,
                 progress_callback=progress)
 
             if alerts.empty:
-                summary = "No vessel with AIS gaps found for this period/filter."
+                summary = "No vessel with AIS gaps found for this CSV/selection."
             else:
                 port_txt = " (in-port loitering/encounters excluded)" if exclude_port else ""
-                summary = f"{len(alerts)} vessel(s) flagged ({start} -> {end}){port_txt}."
+                summary = f"{len(alerts)} vessel(s) flagged ({period_txt}){port_txt}."
             if afe_warning:
                 summary += f" ({afe_warning})"
             if gear_warning:
@@ -852,8 +883,6 @@ def register_callbacks(app):
         Output("alerts-status", "children", allow_duplicate=True),
         Output("alerts-btn-run", "disabled"),
         Input("alerts-btn-run", "n_clicks"),
-        State("alerts-start", "date"),
-        State("alerts-end", "date"),
         State("alerts-flag-filter", "value"),
         State("alerts-vessel-type-filter", "value"),
         State("alerts-gear-type-filter", "value"),
@@ -862,16 +891,20 @@ def register_callbacks(app):
         State("alerts-port-radius", "value"),
         prevent_initial_call=True,
     )
-    def _launch_run(n, start, end, flag_filter, vessel_type_filter, gear_type_filter,
+    def _launch_run(n, flag_filter, vessel_type_filter, gear_type_filter,
                     zone_filter, exclude_port, port_radius):
         if not n:
             raise dash.exceptions.PreventUpdate
+
+        df = _CSV_CACHE.get("df")
+        if df is None or df.empty:
+            return None, True, "Import a CSV first.", False
 
         run_id = str(uuid.uuid4())
         _set_run_state(run_id, status="running", message="Starting...", fraction=0.0)
         t = threading.Thread(
             target=_background_alerts_run,
-            args=(run_id, start, end, flag_filter, vessel_type_filter, gear_type_filter,
+            args=(run_id, df.copy(), flag_filter, vessel_type_filter, gear_type_filter,
                   zone_filter, exclude_port, port_radius),
             daemon=True,
         )

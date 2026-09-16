@@ -5,24 +5,28 @@ pages/protected.py
 under the EU Birds Directive, including Thymaina and Agios Minas + the
 marine area, extracted from data/gis/wdpa.geojson).
 
-For a given date range (defaults to the most recent year), detects
-which vessels passed inside the zone's polygon and shows, per vessel:
-name, flag, type, number of hours detected inside, first/last
-detection. CSV export included.
+For a given date range, detects which vessels passed inside the zone's
+polygon and shows, per vessel: name, flag, type, number of hours
+detected inside, first/last detection. CSV export included.
 
-Two data sources, like the other pages:
-- Precomputed (3.5 years of trajectories): gives vessel_type but NOT
-  gear_type (so no way to specifically isolate "Trawlers" here).
-- Import a downloaded CSV: has the gear_type column -> lets you
-  actually filter/spot trawlers.
+v2 -- SINGLE data source now: an imported CSV, exactly like
+pages/heatmap.py (drag & drop + server-side cache). No more precomputed
+trajectories (load_trajectories_range) and no more "choose an
+already-downloaded CSV from disk" dropdown -- everything (date range,
+vessel types, gear types) is derived live from the file the user drops,
+which also means gear_type is always available here (it wasn't on the
+precomputed source before).
 
-The date range is not locked to a single calendar year (a selection
-can freely span across two years, e.g. Dec 2024 -> Jan 2025), same as
-on the Map page.
+The date range is not locked to a single calendar year (a selection can
+freely span across two years, e.g. Dec 2024 -> Jan 2025), same as
+before -- its bounds are simply taken from the imported CSV's own
+"date" column instead of a fixed global range.
 """
 
+import base64
+import io
 import json
-from datetime import date, timedelta
+from datetime import date
 
 import dash
 import pandas as pd
@@ -33,25 +37,24 @@ from shapely.geometry import shape, Point
 from shapely.prepared import prep
 
 from shared import BG, PANEL, BDR, DIM, MAIN, SOFT, ACC, MAPBOX_KEY, lbl
-from config import YEARS, VESSEL_TYPES, TYPE_COLORS, DEFAULT_COLOR, FLAG_NAMES, ROOT, FOURNI_CENTER
-from loader import load_geojson, load_trajectories_range
-from gfw import list_downloaded_csvs, load_csv, GEAR_TYPES
-
-TRAJECTORY_COLUMNS = ["lat", "lon", "vessel_id", "ship_name", "date", "flag", "vessel_type", "gear_type"]
+from config import VESSEL_TYPES, TYPE_COLORS, DEFAULT_COLOR, FLAG_NAMES, FOURNI_CENTER
+from loader import load_geojson
 
 ZONE_KEY = "fourni_protected"
 ZONE_FILL = [255, 215, 0, 60]
 ZONE_LINE = [255, 215, 0, 230]
 
-# Full range of dates the app has data for -- the start/end date pickers
-# are bounded by this instead of a single calendar year, so a selection
-# can freely cross a year boundary (e.g. Dec 2024 -> Jan 2025).
-GLOBAL_MIN_DATE = date(YEARS[0], 1, 1)
-GLOBAL_MAX_DATE = date(YEARS[-1], 12, 31)
+PLACEHOLDER_STYLE = {"color": DIM, "padding": "2rem", "fontSize": "0.85rem", "fontStyle": "italic"}
+
+# Cache serveur du CSV importé, comme _CSV_CACHE dans pages/heatmap.py --
+# évite l'aller-retour du dataframe par le navigateur.
+_CSV_CACHE = {"df": None, "filename": None}
 
 
 def _load_zone():
-    """Load the Fourni protected area polygon (once)."""
+    """Load the Fourni protected area polygon (once). This is the zone's
+    own boundary definition, not vessel data, so it stays precomputed
+    regardless of where the vessel positions come from."""
     gj = load_geojson(ZONE_KEY)
     if not gj or not gj.get("features"):
         return None, None
@@ -61,6 +64,17 @@ def _load_zone():
 
 
 _ZONE_POLYGON, _ZONE_GEOJSON = _load_zone()
+
+
+def _parse_uploaded_csv(contents, filename):
+    """Identique à heatmap._parse_uploaded_csv (dcc.Upload -> DataFrame)."""
+    if contents is None:
+        return None
+    _, content_string = contents.split(",", 1)
+    decoded = base64.b64decode(content_string)
+    if filename and filename.lower().endswith((".tsv", ".txt")):
+        return pd.read_csv(io.BytesIO(decoded), sep=None, engine="python")
+    return pd.read_csv(io.BytesIO(decoded))
 
 
 def _filter_points_in_zone(df):
@@ -148,9 +162,28 @@ def _aggregate_by_vessel(df):
     return result.sort_values("hours_detected", ascending=False)
 
 
+def _upload_zone():
+    return dcc.Upload(
+        id="prot-csv-upload",
+        children=html.Div([
+            "Drag a CSV here, or ",
+            html.A("browse", style={"color": ACC, "textDecoration": "underline"}),
+        ]),
+        style={
+            "width": "100%", "padding": "1rem 0.5rem",
+            "textAlign": "center", "cursor": "pointer",
+            "border": f"1px dashed {BDR}", "borderRadius": "6px",
+            "color": SOFT, "fontSize": "0.75rem",
+            "marginBottom": "0.5rem",
+        },
+        multiple=False,
+    )
+
+
 def layout():
     return html.Div([
         dcc.Store(id="prot-store-agg", data=None),
+        dcc.Store(id="prot-store-csv-loaded", data=None),
         dcc.Download(id="prot-download-csv"),
 
         # ── Sidebar ──────────────────────────────────────────────────────────
@@ -161,22 +194,26 @@ def layout():
                 clearable=False, style={"color": "#000", "marginBottom": "1rem"}),
 
             html.Div([
+                html.H6("Import a CSV", style={"color": MAIN, "fontSize": "0.82rem", "marginBottom": "0.4rem"}),
+                _upload_zone(),
+                html.Div("No file selected", id="prot-csv-filename",
+                          style={"fontSize": "0.72rem", "color": DIM,
+                                 "fontStyle": "italic", "marginBottom": "0.6rem"}),
+            ], style={"marginBottom": "1.2rem", "paddingBottom": "1.2rem",
+                       "borderBottom": f"1px solid {BDR}"}),
+
+            html.Div([
                 lbl("Jump to a year (optional)"),
                 dcc.Dropdown(id="prot-year", value=None, clearable=True,
-                    options=[{"label": str(y), "value": y} for y in YEARS],
-                    placeholder="Jump to a year...",
+                    options=[], placeholder="Import a CSV first...",
                     style={"color": "#000", "marginBottom": "0.6rem"}),
                 lbl("Start date"),
-                dcc.DatePickerSingle(id="prot-start", date=date(YEARS[-1], 1, 1),
+                dcc.DatePickerSingle(id="prot-start", date=None,
                     display_format="YYYY-MM-DD",
-                    min_date_allowed=GLOBAL_MIN_DATE,
-                    max_date_allowed=GLOBAL_MAX_DATE,
                     style={"marginBottom": "0.6rem"}),
                 lbl("End date"),
-                dcc.DatePickerSingle(id="prot-end", date=date(YEARS[-1], 12, 31),
+                dcc.DatePickerSingle(id="prot-end", date=None,
                     display_format="YYYY-MM-DD",
-                    min_date_allowed=GLOBAL_MIN_DATE,
-                    max_date_allowed=GLOBAL_MAX_DATE,
                     style={"marginBottom": "0.6rem"}),
                 html.P("The range can span across two years (e.g. Dec 2024 -> Jan 2025).",
                        style={"fontSize": "0.68rem", "color": DIM, "fontStyle": "italic",
@@ -215,35 +252,24 @@ def layout():
                     inputStyle={"marginRight": "6px"},
                     style={"marginBottom": "0.8rem"},
                 ),
+
+                # Le filtre gear_type dépend du CSV importé (comme le
+                # filtre gear de heatmap.py) -- il n'a de sens que si la
+                # colonne existe, donc il est masqué par défaut.
+                html.Div(id="prot-gear-wrap", style={"display": "none"}, children=[
+                    lbl("Gear type filter (optional)"),
+                    dcc.Dropdown(id="prot-gear-filter",
+                        options=[], value=[], multi=True,
+                        placeholder="All gear types (e.g. Trawlers)...",
+                        style={"color": "#000", "marginBottom": "0.6rem"}),
+                ]),
+
                 html.Button("Analyze", id="prot-btn-run", n_clicks=0,
                     style={"width": "100%", "padding": "0.5rem",
                            "background": f"linear-gradient(135deg,{ACC},#0d4a7a)",
                            "color": "white", "border": "none",
                            "borderRadius": "6px", "cursor": "pointer", "fontWeight": "600"}),
-            ], style={"marginBottom": "1.2rem", "paddingBottom": "1.2rem",
-                       "borderBottom": f"1px solid {BDR}"}),
-
-            html.Div([
-                html.H6("Import a downloaded CSV", style={"color": MAIN, "fontSize": "0.82rem", "marginBottom": "0.4rem"}),
-                html.P("Needed to filter by gear type (Trawlers): "
-                       "precomputed trajectories don't have this column.",
-                       style={"fontSize": "0.68rem", "color": DIM, "marginBottom": "0.5rem"}),
-                dcc.Dropdown(id="prot-csv-selector",
-                    options=[{"label": f["filename"], "value": f["path"]}
-                             for f in list_downloaded_csvs(ROOT / "data")],
-                    value=None, placeholder="Choose a CSV...",
-                    style={"color": "#000", "marginBottom": "0.6rem"}),
-                lbl("Gear type filter (optional)"),
-                dcc.Dropdown(id="prot-gear-filter",
-                    options=[{"label": g.replace("_", " ").capitalize(), "value": g} for g in GEAR_TYPES],
-                    value=[], multi=True, placeholder="All gear types (e.g. Trawlers)...",
-                    style={"color": "#000", "marginBottom": "0.6rem"}),
-                html.Button("Analyze this CSV", id="prot-btn-run-csv", n_clicks=0,
-                    style={"width": "100%", "padding": "0.5rem",
-                           "background": PANEL, "color": SOFT,
-                           "border": f"1px solid {BDR}", "borderRadius": "6px",
-                           "cursor": "pointer", "marginBottom": "0.4rem"}),
-                html.Div(id="prot-csv-status", style={"fontSize": "0.72rem", "color": SOFT}),
+                html.Div(id="prot-csv-status", style={"fontSize": "0.72rem", "color": SOFT, "marginTop": "0.4rem"}),
             ], style={"marginBottom": "1.2rem", "paddingBottom": "1.2rem",
                        "borderBottom": f"1px solid {BDR}"}),
 
@@ -270,7 +296,9 @@ def layout():
                     type="circle", color=ACC,
                     parent_style={"height": "100%", "width": "100%"},
                     style={"height": "100%", "width": "100%"},
-                    children=html.Div(id="prot-map-container", style={"height": "100%", "width": "100%"}),
+                    children=html.Div(id="prot-map-container",
+                        children=html.P("Import a CSV, then click \"Analyze\".", style=PLACEHOLDER_STYLE),
+                        style={"height": "100%", "width": "100%"}),
                 ),
             ], style={"flex": "1", "minHeight": 0}),
 
@@ -414,6 +442,65 @@ def _summary(agg, note=None):
 
 
 def register_callbacks(app):
+
+    # Parse le CSV dès qu'il est déposé -- peuple le sélecteur d'années,
+    # les bornes des date-pickers (prises dans le fichier lui-même, plus
+    # de plage globale fixe) et l'état du filtre gear_type. L'analyse
+    # elle-même n'a lieu qu'au clic sur "Analyze", plus bas.
+    @app.callback(
+        Output("prot-csv-filename", "children"),
+        Output("prot-year", "options"),
+        Output("prot-year", "value"),
+        Output("prot-start", "date"),
+        Output("prot-start", "min_date_allowed"),
+        Output("prot-start", "max_date_allowed"),
+        Output("prot-end", "date"),
+        Output("prot-end", "min_date_allowed"),
+        Output("prot-end", "max_date_allowed"),
+        Output("prot-gear-wrap", "style"),
+        Output("prot-gear-filter", "options"),
+        Output("prot-store-csv-loaded", "data"),
+        Input("prot-csv-upload", "contents"),
+        State("prot-csv-upload", "filename"),
+        prevent_initial_call=True,
+    )
+    def _on_csv_uploaded(contents, filename):
+        if not contents:
+            raise dash.exceptions.PreventUpdate
+        try:
+            df = _parse_uploaded_csv(contents, filename)
+        except Exception as e:
+            _CSV_CACHE["df"] = None
+            return (f"Error: {e}", [], None, None, None, None, None, None, None,
+                    {"display": "none"}, [], None)
+
+        if "date" not in df.columns:
+            _CSV_CACHE["df"] = None
+            return (f'"{filename}" has no "date" column.', [], None, None, None, None,
+                    None, None, None, {"display": "none"}, [], None)
+
+        df = df.copy()
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        _CSV_CACHE["df"] = df
+        _CSV_CACHE["filename"] = filename
+
+        min_date = df["date"].min()
+        max_date = df["date"].max()
+        min_d = min_date.date() if pd.notna(min_date) else None
+        max_d = max_date.date() if pd.notna(max_date) else None
+
+        years = sorted(df["date"].dt.year.dropna().astype(int).unique(), reverse=True)
+        year_opts = [{"label": str(y), "value": y} for y in years]
+
+        gear_style = {"display": "block"} if "gear_type" in df.columns else {"display": "none"}
+        gear_opts = []
+        if "gear_type" in df.columns:
+            gear_opts = [{"label": g.replace("_", " ").title(), "value": g}
+                         for g in sorted(df["gear_type"].dropna().astype(str).str.upper().unique())]
+
+        return (f"Loaded: {len(df):,} rows from \"{filename}\"", year_opts, None,
+                min_d, min_d, max_d, max_d, min_d, max_d, gear_style, gear_opts, "loaded")
+
     # "Deselect all / Select all" button: toggles the whole type list and
     # flips its own label to match the resulting state.
     @app.callback(
@@ -432,8 +519,8 @@ def register_callbacks(app):
     # of the chosen year, but doesn't restrict the pickers -- the user can
     # still edit either date afterwards, including across a year boundary.
     @app.callback(
-        Output("prot-start", "date"),
-        Output("prot-end", "date"),
+        Output("prot-start", "date", allow_duplicate=True),
+        Output("prot-end", "date", allow_duplicate=True),
         Input("prot-year", "value"),
         prevent_initial_call=True,
     )
@@ -449,62 +536,48 @@ def register_callbacks(app):
         Output("prot-csv-status", "children"),
         Output("prot-store-agg", "data"),
         Input("prot-btn-run", "n_clicks"),
-        Input("prot-btn-run-csv", "n_clicks"),
         State("prot-start", "date"),
         State("prot-end", "date"),
-        State("prot-csv-selector", "value"),
         State("prot-gear-filter", "value"),
         State("prot-type-filter", "value"),
-        prevent_initial_call=False,
+        prevent_initial_call=True,
     )
-    
-    def run_analysis(n1, n2, start, end, csv_path, gear_filter, type_filter):
-        trigger = dash.callback_context.triggered_id if dash.callback_context.triggered else None
+    def run_analysis(n, start, end, gear_filter, type_filter):
+        if not n:
+            raise dash.exceptions.PreventUpdate
 
         if _ZONE_POLYGON is None:
             msg = html.P("Zone not found: data/gis/fourni_protected.geojson is missing.",
                           style={"color": "#ff6b6b"})
             return _build_zone_map(pd.DataFrame()), "", msg, "", None
 
-        if trigger == "prot-btn-run-csv":
-            if not csv_path:
-                return _build_zone_map(pd.DataFrame()), "", "", "Choose a CSV first.", None
-            try:
-                df = load_csv(csv_path)
-            except Exception as e:
-                return _build_zone_map(pd.DataFrame()), "", "", f"Error: {e}", None
+        df = _CSV_CACHE.get("df")
+        if df is None or df.empty:
+            return (html.P("Import a CSV first.", style=PLACEHOLDER_STYLE), "", "",
+                    "Import a CSV first.", None)
 
-            df_inside = _filter_points_in_zone(df)
-            # Filter by vessel type if the column exists (precomputed trajectories have it, but imported CSVs may not)
-            if type_filter is not None and "vessel_type" in df_inside.columns:
-                df_inside = df_inside[df_inside["vessel_type"].astype(str).str.upper().isin(
-                    [t.upper() for t in type_filter])]
-            if gear_filter and "gear_type" in df_inside.columns:
-                df_inside = df_inside[df_inside["gear_type"].astype(str).str.upper().isin(
-                    [g.upper() for g in gear_filter])]
-            agg = _aggregate_by_vessel(df_inside)
-            note = "Analysis based on the imported CSV (gear_type available)."
-            status = f"CSV loaded: {len(df):,} rows -> {len(df_inside):,} positions in the zone"
-            return _build_zone_map(df_inside), _vessel_table(agg), _summary(agg, note), status, (agg.to_dict("records") if not agg.empty else None)
+        sub = df
+        if start and end:
+            s, e = pd.to_datetime(start), pd.to_datetime(end)
+            if s > e:
+                s, e = e, s
+            sub = sub[(sub["date"] >= s) & (sub["date"] <= e + pd.Timedelta(days=1))]
 
-        if not start or not end:
-            return _build_zone_map(pd.DataFrame()), "", "Select a date range.", "", None
-
-        # Be forgiving if the user picks the dates in the "wrong" order.
-        if pd.to_datetime(start) > pd.to_datetime(end):
-            start, end = end, start
-
-        df = load_trajectories_range(start, end, None, None, columns=TRAJECTORY_COLUMNS)
-        df_inside = _filter_points_in_zone(df)
-        # Filter by vessel type (checkboxes) before aggregating / mapping / exporting
+        df_inside = _filter_points_in_zone(sub)
         if type_filter is not None and "vessel_type" in df_inside.columns:
             df_inside = df_inside[df_inside["vessel_type"].astype(str).str.upper().isin(
                 [t.upper() for t in type_filter])]
-        agg = _aggregate_by_vessel(df_inside)
-        note = ("Based on precomputed trajectories "
-                "(vessel_type and gear_type available).")
-        return _build_zone_map(df_inside), _vessel_table(agg), _summary(agg, note), "", (agg.to_dict("records") if not agg.empty else None)
+        if gear_filter and "gear_type" in df_inside.columns:
+            df_inside = df_inside[df_inside["gear_type"].astype(str).str.upper().isin(
+                [g.upper() for g in gear_filter])]
 
+        agg = _aggregate_by_vessel(df_inside)
+        filename = _CSV_CACHE.get("filename") or "CSV"
+        note = "Analysis based on the imported CSV." + (
+            " (gear_type available)" if "gear_type" in df.columns else "")
+        status = f"\"{filename}\": {len(sub):,} rows in range -> {len(df_inside):,} positions in the zone"
+        return (_build_zone_map(df_inside), _vessel_table(agg), _summary(agg, note), status,
+                (agg.to_dict("records") if not agg.empty else None))
 
     @app.callback(
         Output("prot-download-csv", "data"),

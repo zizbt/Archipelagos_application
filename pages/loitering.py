@@ -1,12 +1,20 @@
 """
 pages/loitering.py
 ==================
-Page "Loitering" -- Detection of vessels holding a low speed for a sustained period.
+Page "Loitering" -- Detection of vessels holding a low speed for a
+sustained period.
 
+v2 -- SINGLE data source now: an imported CSV, exactly like
+pages/heatmap.py (drag & drop + server-side cache). No more precomputed
+trajectories (load_trajectories_range) and no more fixed global date
+range -- the date-pickers bounds and the "jump to a year" dropdown are
+derived live from the imported CSV's own "date" column.
 """
 
 import json
 from datetime import date
+import base64
+import io
 
 import dash
 import numpy as np
@@ -17,19 +25,30 @@ import geopandas as gpd
 from dash import dcc, html, Input, Output, State, dash_table
 
 from shared import BG, PANEL, BDR, DIM, MAIN, SOFT, ACC, MAPBOX_KEY, lbl, AEGEAN_CENTER
-from config import YEARS
-from loader import load_trajectories_range
 from port_zones import port_mask_from_xy, PORT_RADIUS_M_DEFAULT, has_ports
 
-TRAJECTORY_COLUMNS = ["lat", "lon", "vessel_id", "ship_name", "date"]
-
-GLOBAL_MIN_DATE = date(YEARS[0], 1, 1)
-GLOBAL_MAX_DATE = date(YEARS[-1], 12, 31)
+PLACEHOLDER_STYLE = {"color": DIM, "padding": "2rem", "fontSize": "0.85rem", "fontStyle": "italic"}
 
 DEFAULT_SPEED = 1.5
 DEFAULT_DURATION = 2.0
 
 LOITER_COLOR = [255, 140, 0, 170]
+
+# Cache serveur du CSV importé, comme _CSV_CACHE dans pages/heatmap.py --
+# évite l'aller-retour du dataframe par le navigateur.
+_CSV_CACHE = {"df": None, "filename": None}
+
+
+def _parse_uploaded_csv(contents, filename):
+    """Identique à heatmap._parse_uploaded_csv (dcc.Upload -> DataFrame)."""
+    if contents is None:
+        return None
+    _, content_string = contents.split(",", 1)
+    decoded = base64.b64decode(content_string)
+    if filename and filename.lower().endswith((".tsv", ".txt")):
+        return pd.read_csv(io.BytesIO(decoded), sep=None, engine="python")
+    return pd.read_csv(io.BytesIO(decoded))
+
 
 # CALCUL DU LOITERING
 def get_loitering_dataframe(df, speed_threshold_knots=DEFAULT_SPEED,
@@ -126,10 +145,29 @@ def get_loitering_dataframe(df, speed_threshold_knots=DEFAULT_SPEED,
     return agg[empty_cols].sort_values('start').reset_index(drop=True)
 
 
+def _upload_zone():
+    return dcc.Upload(
+        id="loi-csv-upload",
+        children=html.Div([
+            "Drag a CSV here, or ",
+            html.A("browse", style={"color": ACC, "textDecoration": "underline"}),
+        ]),
+        style={
+            "width": "100%", "padding": "1rem 0.5rem",
+            "textAlign": "center", "cursor": "pointer",
+            "border": f"1px dashed {BDR}", "borderRadius": "6px",
+            "color": SOFT, "fontSize": "0.75rem",
+            "marginBottom": "0.5rem",
+        },
+        multiple=False,
+    )
+
+
 # LAYOUT
 def layout():
     return html.Div([
         dcc.Store(id="loi-store", data=None),
+        dcc.Store(id="loi-store-csv-loaded", data=None),
         dcc.Download(id="loi-download-csv"),
 
         # ── Sidebar ──────────────────────────────────────────────
@@ -138,20 +176,26 @@ def layout():
             html.P("Vessels holding a low speed for a sustained period.",
                    style={"fontSize": "0.7rem", "color": DIM, "marginBottom": "1rem"}),
 
+            html.Div([
+                html.H6("Import a CSV", style={"color": MAIN, "fontSize": "0.82rem", "marginBottom": "0.4rem"}),
+                _upload_zone(),
+                html.Div("No file selected", id="loi-csv-filename",
+                          style={"fontSize": "0.72rem", "color": DIM,
+                                 "fontStyle": "italic", "marginBottom": "0.6rem"}),
+            ], style={"marginBottom": "1rem", "paddingBottom": "1rem",
+                       "borderBottom": f"1px solid {BDR}"}),
+
             lbl("Jump to a year (optional)"),
             dcc.Dropdown(id="loi-year", value=None, clearable=True,
-                options=[{"label": str(y), "value": y} for y in YEARS],
-                placeholder="Jump to a year...",
+                options=[], placeholder="Import a CSV first...",
                 style={"color": "#000", "marginBottom": "0.6rem"}),
             lbl("Start date"),
-            dcc.DatePickerSingle(id="loi-start", date=date(YEARS[-1], 1, 1),
+            dcc.DatePickerSingle(id="loi-start", date=None,
                 display_format="YYYY-MM-DD",
-                min_date_allowed=GLOBAL_MIN_DATE, max_date_allowed=GLOBAL_MAX_DATE,
                 style={"marginBottom": "0.6rem"}),
             lbl("End date"),
-            dcc.DatePickerSingle(id="loi-end", date=date(YEARS[-1], 1, 31),
+            dcc.DatePickerSingle(id="loi-end", date=None,
                 display_format="YYYY-MM-DD",
-                min_date_allowed=GLOBAL_MIN_DATE, max_date_allowed=GLOBAL_MAX_DATE,
                 style={"marginBottom": "1rem"}),
 
             html.Div([
@@ -225,7 +269,9 @@ def layout():
                 dcc.Loading(type="circle", color=ACC,
                     parent_style={"height": "100%", "width": "100%"},
                     style={"height": "100%", "width": "100%"},
-                    children=html.Div(id="loi-map-container", style={"height": "100%", "width": "100%"}),
+                    children=html.Div(id="loi-map-container",
+                        children=html.P("Import a CSV, then click \"Analyze\".", style=PLACEHOLDER_STYLE),
+                        style={"height": "100%", "width": "100%"}),
                 ),
                 html.Div(id="loi-click-info",
                     style={"position": "absolute", "top": "0.6rem", "left": "0.6rem",
@@ -303,9 +349,59 @@ def _click_panel(obj):
 # CALLBACKS
 def register_callbacks(app):
 
+    # Parse le CSV dès qu'il est déposé -- peuple le sélecteur d'années et
+    # les bornes des date-pickers (prises dans le fichier lui-même). La
+    # détection de loitering n'a lieu qu'au clic sur "Analyze", plus bas.
     @app.callback(
+        Output("loi-csv-filename", "children"),
+        Output("loi-year", "options"),
+        Output("loi-year", "value"),
         Output("loi-start", "date"),
+        Output("loi-start", "min_date_allowed"),
+        Output("loi-start", "max_date_allowed"),
         Output("loi-end", "date"),
+        Output("loi-end", "min_date_allowed"),
+        Output("loi-end", "max_date_allowed"),
+        Output("loi-store-csv-loaded", "data"),
+        Input("loi-csv-upload", "contents"),
+        State("loi-csv-upload", "filename"),
+        prevent_initial_call=True,
+    )
+    def _on_csv_uploaded(contents, filename):
+        if not contents:
+            raise dash.exceptions.PreventUpdate
+        try:
+            df = _parse_uploaded_csv(contents, filename)
+        except Exception as e:
+            _CSV_CACHE["df"] = None
+            return (f"Error: {e}", [], None, None, None, None, None, None, None, None)
+
+        required = {"lat", "lon", "vessel_id", "date"}
+        if not required.issubset(df.columns):
+            _CSV_CACHE["df"] = None
+            missing = ", ".join(sorted(required - set(df.columns)))
+            return (f'"{filename}" is missing required column(s): {missing}.',
+                    [], None, None, None, None, None, None, None, None)
+
+        df = df.copy()
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        _CSV_CACHE["df"] = df
+        _CSV_CACHE["filename"] = filename
+
+        min_date = df["date"].min()
+        max_date = df["date"].max()
+        min_d = min_date.date() if pd.notna(min_date) else None
+        max_d = max_date.date() if pd.notna(max_date) else None
+
+        years = sorted(df["date"].dt.year.dropna().astype(int).unique(), reverse=True)
+        year_opts = [{"label": str(y), "value": y} for y in years]
+
+        return (f"Loaded: {len(df):,} rows from \"{filename}\"", year_opts, None,
+                min_d, min_d, max_d, max_d, min_d, max_d, "loaded")
+
+    @app.callback(
+        Output("loi-start", "date", allow_duplicate=True),
+        Output("loi-end", "date", allow_duplicate=True),
         Input("loi-year", "value"),
         prevent_initial_call=True,
     )
@@ -331,11 +427,21 @@ def register_callbacks(app):
         if not n:
             raise dash.exceptions.PreventUpdate
 
-        df = load_trajectories_range(start, end, None, None, columns=TRAJECTORY_COLUMNS)
+        df = _CSV_CACHE.get("df")
         if df is None or df.empty:
-            return _build_map(None), "No trajectory data for this range.", None
+            return html.P("Import a CSV first.", style=PLACEHOLDER_STYLE), "Import a CSV first.", None
 
-        loi = get_loitering_dataframe(df, speed_threshold_knots=float(speed),
+        sub = df
+        if start and end:
+            s, e = pd.to_datetime(start), pd.to_datetime(end)
+            if s > e:
+                s, e = e, s
+            sub = sub[(sub["date"] >= s) & (sub["date"] <= e + pd.Timedelta(days=1))]
+
+        if sub.empty:
+            return _build_map(None), "No rows for this range.", None
+
+        loi = get_loitering_dataframe(sub, speed_threshold_knots=float(speed),
                                       min_duration_hours=float(duration),
                                       port_radius_m=port_radius or PORT_RADIUS_M_DEFAULT)
 

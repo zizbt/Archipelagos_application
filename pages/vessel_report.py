@@ -1,126 +1,217 @@
 """
 pages/vessel_report.py
 =======================
-Page "Vessel Report" -- recherche un navire (nom / MMSI / IMO), le
-selectionne, choisit une periode, puis genere un rapport complet :
+Page "Vessel Report" -- importe un CSV de positions AIS, liste les
+navires trouves dedans, en selectionne un, puis genere un rapport :
 
-  - Port visits    (public-global-port-visits-events:latest)
-  - AIS gaps        (public-global-gaps-events:latest)
-  - Fishing events  (public-global-fishing-events:latest)
-  - Loitering events(public-global-loitering-events:latest)
-  - Encounters      (public-global-encounters-events:latest)
+  - Port visits     (detecte localement -- proximite d'un point de port
+                      connu, voir port_zones.py, regroupee en visites)
+  - AIS gaps         (detecte localement -- diff des positions
+                      consecutives du navire, classe suspicious/normal
+                      via le buffer de couverture AIS, meme methode que
+                      pages/ais_gap.py / pages/alerts.py)
+  - Loitering events (pages/loitering.get_loitering_dataframe)
+  - Encounters       (pages/encounter.get_encounters_dataframe, sur
+                      l'ensemble du CSV -- un "encounter" implique un
+                      autre navire -- puis filtre sur celui selectionne)
 
-Chaque section est recuperee independamment (5 appels GFW separes) : si un
-dataset echoue (nom incorrect, non disponible sur la cle...), seule cette
-section affiche l'erreur -- les autres s'affichent normalement.
+v2 -- SINGLE data source now: an imported CSV, exactly like
+pages/heatmap.py (drag & drop + server-side cache). No more live GFW
+vessel search (name/MMSI/IMO) and no more date-range filter -- the
+"vessels found" list comes from the imported CSV's own vessel_id/
+ship_name columns, and the whole file is analyzed for the selected
+vessel (no date pickers).
 
-Les champs de chaque type d'evenement sont extraits dynamiquement (pas de
-noms de colonnes codes en dur au-dela de start/end/lat/lon) via un
-"flatten" generique du sous-objet pydantic renvoye par l'API, pour rester
-robuste si le schema exact differe de ce qui est suppose ici.
+NOTE on "Fishing events": this section is INTENTIONALLY DROPPED in this
+version. It existed before as GFW's own "public-global-fishing-events"
+dataset (a proprietary speed/heading classification model run
+server-side on GFW's data) -- there is no equivalent local algorithm in
+this app to reproduce it from raw imported AIS positions, and making one
+up would silently present unreliable results as if they were a real
+detection. If you need fishing-event detection, that still requires a
+live GFW call (see the old GFW-search-based version of this page, or
+pages/ais_gap.py / pages/report.py's AFE report for GFW-side fishing
+data).
 """
 
-import asyncio
-from datetime import date
+import base64
+import io
 
 import dash
 import pandas as pd
+import geopandas as gpd
 from dash import dcc, html, Input, Output, State, dash_table
 
 from shared import BG, PANEL, BDR, DIM, MAIN, SOFT, ACC, lbl, card
-from config import YEARS
-from gfw import get_gfw_client
-from api_key import get_api_key
+from gfw import load_ais_buffer_polygon, classify_gap_status
+from port_zones import port_mask_from_xy, PORT_RADIUS_M_DEFAULT, has_ports
+from pages.loitering import get_loitering_dataframe
+from pages.encounter import get_encounters_dataframe
 
-GLOBAL_MIN_DATE = date(YEARS[0], 1, 1)
-GLOBAL_MAX_DATE = date(YEARS[-1], 12, 31)
-
-EVENT_DATASETS = {
-    "port_visit": "public-global-port-visits-events:latest",
-    "gap":        "public-global-gaps-events:latest",
-    "fishing":    "public-global-fishing-events:latest",
-    "loitering":  "public-global-loitering-events:latest",
-    "encounter":  "public-global-encounters-events:latest",
-}
+GAP_THRESHOLD_HOURS = 3    # any gap longer than this counts as an AIS blackout
+DEFAULT_BUFFER_NM = 3      # AIS coverage buffer distance -- must match pages/ais_gap.py's
+VISIT_GAP_THRESHOLD_HOURS = 3  # gap between two "in port" points before it's a new visit
 
 SECTION_LABELS = {
     "port_visit": "Port visits",
     "gap":        "AIS gaps",
-    "fishing":    "Fishing events",
     "loitering":  "Loitering events",
     "encounter":  "Encounters",
 }
 
+PLACEHOLDER_STYLE = {"color": DIM, "padding": "2rem", "fontSize": "0.85rem", "fontStyle": "italic"}
 
-# ── Appel sync GFW (evite de bloquer la boucle Dash) ────────────────────────
-
-def do_search_vessel(query, api_key):
-    client = get_gfw_client(api_key)
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        df = loop.run_until_complete(search_vessel(query, client))
-    finally:
-        loop.close()
-    return df if df is not None else pd.DataFrame()
+# Cache serveur du CSV importé, comme _CSV_CACHE dans pages/heatmap.py --
+# évite l'aller-retour du dataframe par le navigateur.
+_CSV_CACHE = {"df": None, "filename": None}
 
 
-def do_full_report(vessel_ids, start, end, api_key):
-    """Renvoie un dict {event_key: (df, error_or_None)} pour les 5 types."""
-    client = get_gfw_client(api_key)
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        results = {}
-        for key, dataset in EVENT_DATASETS.items():
-            try:
-                df = loop.run_until_complete(
-                    load_events(dataset, key, vessel_ids, start, end, client))
-                results[key] = (df, None)
-            except Exception as e:
-                results[key] = (pd.DataFrame(), str(e)[:120])
-    finally:
-        loop.close()
-    return results
+def _parse_uploaded_csv(contents, filename):
+    """Identique à heatmap._parse_uploaded_csv (dcc.Upload -> DataFrame)."""
+    if contents is None:
+        return None
+    _, content_string = contents.split(",", 1)
+    decoded = base64.b64decode(content_string)
+    if filename and filename.lower().endswith((".tsv", ".txt")):
+        return pd.read_csv(io.BytesIO(decoded), sep=None, engine="python")
+    return pd.read_csv(io.BytesIO(decoded))
 
 
-def _group_results_by_mmsi(df):
-    """Identique aux autres pages (ports.py / ais_gap.py)."""
+def _find_vessels_in_csv(df):
+    """Liste les navires distincts presents dans le CSV importe, meme
+    forme d'entree que l'ancienne _group_results_by_mmsi (label, ids,
+    name, flag...) mais construite depuis les colonnes du CSV plutot
+    qu'une recherche GFW."""
     entries = []
-    if df is None or df.empty:
+    if df is None or df.empty or "vessel_id" not in df.columns:
         return entries
-    if "to" in df.columns:
-        df = df.sort_values("to", ascending=False)
 
-    seen = set()
-    for _, row in df.iterrows():
-        vid = row.get("vessel_id")
-        mmsi = row.get("mmsi")
-        if pd.isnull(vid) or pd.isnull(mmsi):
-            continue
-        if mmsi in seen:
-            continue
-        seen.add(mmsi)
-
-        grp = df[df["mmsi"] == mmsi]
-        ids = grp["vessel_id"].dropna().tolist()
-
+    for vid, grp in df.groupby("vessel_id"):
         def first_valid(col):
-            s = grp[col].dropna() if col in grp.columns else pd.Series(dtype=object)
+            if col not in grp.columns:
+                return None
+            s = grp[col].dropna()
             return s.iloc[0] if not s.empty else None
 
-        name = row.get("ship_name") if pd.notnull(row.get("ship_name")) else "Unknown"
-        flag = row.get("flag") if pd.notnull(row.get("flag")) else "?"
-        owner = row.get("owner") if pd.notnull(row.get("owner")) else "Owner unknown"
-        label = f"{name} | MMSI {mmsi} | {flag} | Owner: {owner}"
+        name = first_valid("ship_name") or "Unknown"
+        mmsi = first_valid("mmsi") or "?"
+        flag = first_valid("flag") or "?"
+        label = f"{name} | MMSI {mmsi} | {flag}"
         entries.append({
-            "label": label, "ids": ids, "name": name, "owner": owner,
-            "mmsi": mmsi, "imo": first_valid("imo"), "flag": flag,
-            "vessel_type": first_valid("vessel_type"),
+            "label": label, "ids": [vid], "name": name, "mmsi": mmsi, "flag": flag,
+            "imo": first_valid("imo"), "vessel_type": first_valid("vessel_type"),
             "gear_type": first_valid("gear_type"),
-            "length_m": first_valid("length_m"),
         })
+    entries.sort(key=lambda e: str(e["name"]))
     return entries
+
+
+def _project_xy(df):
+    """Ajoute des colonnes x/y en metres (EPSG:32634), reutilise par la
+    detection de port visits et le calcul de gaps."""
+    gdf = gpd.GeoDataFrame(df.copy(), geometry=gpd.points_from_xy(df.lon, df.lat),
+                           crs="EPSG:4326").to_crs("EPSG:32634")
+    df = df.copy()
+    df["x"] = gdf.geometry.x.values
+    df["y"] = gdf.geometry.y.values
+    return df
+
+
+def _detect_gaps_local(df_vessel, gap_threshold_hours=GAP_THRESHOLD_HOURS, buffer_nm=DEFAULT_BUFFER_NM):
+    """Detecte les trous AIS d'un navire par simple diff des positions
+    consecutives (le CSV importe a sa propre resolution temporelle --
+    pas d'hypothese sur un pas fixe). Chaque trou est classe suspicious/
+    normal via le meme buffer de couverture AIS que pages/ais_gap.py."""
+    empty = pd.DataFrame(columns=["start", "end", "duration_hrs", "off_lat", "off_lon",
+                                  "on_lat", "on_lon", "status"])
+    d = df_vessel.copy()
+    d["date"] = pd.to_datetime(d["date"], errors="coerce")
+    d = d.dropna(subset=["date", "lat", "lon"]).sort_values("date")
+    if len(d) < 2:
+        return empty
+
+    d["prev_date"] = d["date"].shift()
+    d["prev_lat"] = d["lat"].shift()
+    d["prev_lon"] = d["lon"].shift()
+    d["gap_hours"] = (d["date"] - d["prev_date"]).dt.total_seconds() / 3600
+
+    gaps = d[d["gap_hours"] >= gap_threshold_hours].copy()
+    if gaps.empty:
+        return empty
+
+    buffer_geom = load_ais_buffer_polygon(buffer_nm)
+    if buffer_geom is not None:
+        gaps["status"] = gaps.apply(
+            lambda r: classify_gap_status(r["prev_lat"], r["prev_lon"], r["lat"], r["lon"], buffer_geom),
+            axis=1)
+    else:
+        gaps["status"] = "gap"  # unclassified -- no buffer file found
+
+    out = pd.DataFrame({
+        "start": gaps["prev_date"].dt.strftime("%Y-%m-%d %H:%M"),
+        "end": gaps["date"].dt.strftime("%Y-%m-%d %H:%M"),
+        "duration_hrs": gaps["gap_hours"].round(2),
+        "off_lat": gaps["prev_lat"].round(5),
+        "off_lon": gaps["prev_lon"].round(5),
+        "on_lat": gaps["lat"].round(5),
+        "on_lon": gaps["lon"].round(5),
+        "status": gaps["status"],
+    })
+    return out.sort_values("start").reset_index(drop=True)
+
+
+def _detect_port_visits_local(df_vessel, port_radius_m=PORT_RADIUS_M_DEFAULT):
+    """Detecte les visites de port d'un navire : positions a moins de
+    port_radius_m d'un point de port connu (port_zones.py), regroupees
+    en visites distinctes des qu'un ecart de plus de
+    VISIT_GAP_THRESHOLD_HOURS separe deux positions "in port"."""
+    empty = pd.DataFrame(columns=["start", "end", "duration_hrs", "n_points"])
+    if not has_ports():
+        return empty
+
+    d = df_vessel.copy()
+    d["date"] = pd.to_datetime(d["date"], errors="coerce")
+    d = d.dropna(subset=["date", "lat", "lon"]).sort_values("date")
+    if d.empty:
+        return empty
+
+    d = _project_xy(d)
+    d["in_port"] = port_mask_from_xy(d["x"].values, d["y"].values, radius_m=port_radius_m)
+    d = d[d["in_port"]]
+    if d.empty:
+        return empty
+
+    d["gap"] = d["date"].diff()
+    d["visit_id"] = (d["gap"] > pd.Timedelta(hours=VISIT_GAP_THRESHOLD_HOURS)).cumsum()
+
+    rows = []
+    for _, visit in d.groupby("visit_id"):
+        start, end = visit["date"].min(), visit["date"].max()
+        rows.append({
+            "start": start.strftime("%Y-%m-%d %H:%M"),
+            "end": end.strftime("%Y-%m-%d %H:%M"),
+            "duration_hrs": round((end - start).total_seconds() / 3600, 2),
+            "n_points": len(visit),
+        })
+    return pd.DataFrame(rows).sort_values("start").reset_index(drop=True)
+
+
+def _upload_zone():
+    return dcc.Upload(
+        id="vr-csv-upload",
+        children=html.Div([
+            "Drag a CSV here, or ",
+            html.A("browse", style={"color": ACC, "textDecoration": "underline"}),
+        ]),
+        style={
+            "width": "100%", "padding": "1rem 0.5rem",
+            "textAlign": "center", "cursor": "pointer",
+            "border": f"1px dashed {BDR}", "borderRadius": "6px",
+            "color": SOFT, "fontSize": "0.75rem",
+            "marginBottom": "0.5rem",
+        },
+        multiple=False,
+    )
 
 
 # ── LAYOUT ───────────────────────────────────────────────────────────────────
@@ -128,27 +219,25 @@ def _group_results_by_mmsi(df):
 def layout():
     return html.Div([
         dcc.Store(id="vr-search-store", data=None),
+        dcc.Store(id="vr-csv-loaded", data=None),
         dcc.Store(id="vr-report-store", data=None),
         dcc.Download(id="vr-download-csv"),
 
         html.Div([
             html.H6("Vessel report", style={"color": MAIN, "fontSize": "0.82rem", "marginBottom": "0.4rem"}),
-            html.P("Search a vessel, select it, choose a period, and get a full "
-                   "activity report: port visits, AIS gaps, fishing, loitering "
-                   "and encounters.",
+            html.P("Import a CSV, select a vessel found in it, and get a full "
+                   "activity report: port visits, AIS gaps, loitering and "
+                   "encounters -- all computed from the imported positions.",
                    style={"fontSize": "0.7rem", "color": DIM, "marginBottom": "1rem"}),
 
-            lbl("Vessel name / MMSI / IMO"),
-            dcc.Input(id="vr-query", type="text", placeholder="Vessel name / MMSI / IMO",
-                debounce=True,
-                style={"width": "100%", "padding": "0.4rem", "marginBottom": "0.5rem",
-                       "borderRadius": "5px", "border": "1px solid " + BDR,
-                       "background": PANEL, "color": MAIN}),
-            html.Button("Search", id="vr-btn-search", n_clicks=0,
-                style={"width": "100%", "padding": "0.45rem",
-                       "background": "linear-gradient(135deg," + ACC + ",#0d4a7a)",
-                       "color": "white", "border": "none", "borderRadius": "6px",
-                       "cursor": "pointer", "fontWeight": "600", "marginBottom": "0.8rem"}),
+            html.Div([
+                html.H6("Import a CSV", style={"color": MAIN, "fontSize": "0.82rem", "marginBottom": "0.4rem"}),
+                _upload_zone(),
+                html.Div("No file selected", id="vr-csv-filename",
+                          style={"fontSize": "0.72rem", "color": DIM,
+                                 "fontStyle": "italic", "marginBottom": "0.6rem"}),
+            ], style={"marginBottom": "1rem", "paddingBottom": "1rem",
+                       "borderBottom": "1px solid " + BDR}),
 
             lbl("Vessels found"),
             dcc.Loading(type="dot", color=ACC,
@@ -163,16 +252,10 @@ def layout():
             html.Div(id="vr-selected", style={"fontSize": "0.72rem", "color": ACC,
                                                "fontWeight": "600", "marginBottom": "0.8rem"}),
 
-            lbl("Start date"),
-            dcc.DatePickerSingle(id="vr-start", date=date(YEARS[-1], 1, 1),
-                display_format="YYYY-MM-DD",
-                min_date_allowed=GLOBAL_MIN_DATE, max_date_allowed=GLOBAL_MAX_DATE,
-                style={"marginBottom": "0.6rem"}),
-            lbl("End date"),
-            dcc.DatePickerSingle(id="vr-end", date=date(YEARS[-1], 12, 31),
-                display_format="YYYY-MM-DD",
-                min_date_allowed=GLOBAL_MIN_DATE, max_date_allowed=GLOBAL_MAX_DATE,
-                style={"marginBottom": "1rem"}),
+            html.P("The whole imported file is analyzed for the selected vessel -- "
+                   "there's no date-range filter here.",
+                   style={"fontSize": "0.68rem", "color": DIM, "fontStyle": "italic",
+                          "marginBottom": "0.6rem"}),
 
             html.Button("Generate Report", id="vr-btn-run", n_clicks=0,
                 style={"width": "100%", "padding": "0.5rem",
@@ -183,19 +266,11 @@ def layout():
 
             html.Div(id="vr-status", style={"fontSize": "0.72rem", "color": SOFT}),
 
-        # Pas de hauteur figee / overflowY force ici (ca dependait d'une
-        # hauteur de nav devinee et fausse). "position: sticky" fait rester
-        # la sidebar visible pendant le scroll de la page, sans avoir besoin
-        # de connaitre la hauteur exacte du bandeau au-dessus.
         ], style={"width": "320px", "minWidth": "320px", "padding": "1rem",
                    "background": BG, "borderRight": "1px solid " + BDR,
                    "flexShrink": "0", "position": "sticky", "top": "0",
                    "alignSelf": "flex-start", "maxHeight": "100vh", "overflowY": "auto"}),
 
-        # minWidth:0 est essentiel : sans lui, un flex-item refuse de retrecir
-        # en dessous de la largeur de son contenu. Le tableau (beaucoup de
-        # colonnes) forcait donc TOUTE la ligne (sidebar comprise) a deborder
-        # horizontalement au lieu de rester dans son propre scroll interne.
         html.Div([
             html.Div(
                 html.Button("Export full CSV", id="vr-btn-export", n_clicks=0,
@@ -211,9 +286,8 @@ def layout():
             html.Div(
                 dcc.Loading(type="circle", color=ACC,
                     children=html.Div(id="vr-report",
-                        children=html.P("Search a vessel, select it, choose dates, "
-                                        "then click Generate Report.",
-                                        style={"color": DIM, "fontSize": "0.8rem"}))),
+                        children=html.P("Import a CSV, select a vessel, then click "
+                                        "\"Generate Report\".", style=PLACEHOLDER_STYLE))),
                 style={"padding": "1rem", "minWidth": "0", "overflowX": "auto"},
             ),
         ], style={"flex": "1", "minWidth": "0", "display": "flex", "flexDirection": "column"}),
@@ -223,48 +297,17 @@ def layout():
 
 # ── Rendu du rapport ─────────────────────────────────────────────────────────
 
-def _pick_display_cols(df, extra_keywords=("duration", "distance", "speed", "km", "hour", "confidence")):
-    """Choisit un sous-ensemble de colonnes lisibles pour l'affichage,
-    sans presumer des noms exacts au-dela de start/end/lat/lon.
-
-    Exclut les colonnes qui contiennent en realite un blob JSON (ex:
-    "..._distances" est une LISTE de dicts que json_normalize ne peut
-    pas aplatir plus loin ; _sanitize_for_display la convertit en texte
-    JSON tres long, ce qui rend la colonne illisible et fait deborder
-    le tableau horizontalement bien au-dela de l'ecran)."""
-    priority = [c for c in ("start", "end", "lat", "lon") if c in df.columns]
-    others = []
-    for c in df.columns:
-        if c in priority:
-            continue
-        if not any(k in c.lower() for k in extra_keywords):
-            continue
-        sample = df[c].dropna().astype(str)
-        if not sample.empty and sample.str.len().mean() > 40:
-            continue  # colonne JSON/liste brute -> on ne l'affiche pas
-        others.append(c)
-    cols = priority + others
-    return cols if cols else list(df.columns)[:8]
-
-
-def _section_table(key, df, error):
+def _section_table(key, df):
     label = SECTION_LABELS[key]
-    if error:
-        return html.Div([
-            html.H6(label, style={"color": MAIN, "fontSize": "0.85rem", "marginBottom": "0.3rem"}),
-            html.P("Error: " + error, style={"color": "#e07070", "fontSize": "0.72rem"}),
-        ], style={"marginBottom": "1.2rem"})
-
     if df is None or df.empty:
         return html.Div([
             html.H6(label, style={"color": MAIN, "fontSize": "0.85rem", "marginBottom": "0.3rem"}),
-            html.P("None found for this period.", style={"color": SOFT, "fontSize": "0.75rem"}),
+            html.P("None found for this vessel.", style={"color": SOFT, "fontSize": "0.75rem"}),
         ], style={"marginBottom": "1.2rem"})
 
-    cols = _pick_display_cols(df)
     table = dash_table.DataTable(
-        data=df[cols].to_dict("records"),
-        columns=[{"name": c.replace("_", " ").title(), "id": c} for c in cols],
+        data=df.to_dict("records"),
+        columns=[{"name": c.replace("_", " ").title(), "id": c} for c in df.columns],
         sort_action="native", filter_action="native", page_size=10,
         style_table={"overflowX": "auto"},
         style_cell={"backgroundColor": BG, "color": SOFT, "border": "1px solid " + BDR,
@@ -278,39 +321,30 @@ def _section_table(key, df, error):
     ], style={"marginBottom": "1.2rem", "minWidth": "0"})
 
 
-def _summary_bar(info, start, end, results):
-    def count(key):
-        df, err = results.get(key, (pd.DataFrame(), None))
-        return "err" if err else len(df)
-
-    stats = [
-        ("Port visits", count("port_visit")),
-        ("AIS gaps", count("gap")),
-        ("Fishing events", count("fishing")),
-        ("Loitering events", count("loitering")),
-        ("Encounters", count("encounter")),
-    ]
+def _summary_bar(info, results):
+    stats = [(SECTION_LABELS[k], len(results.get(k, pd.DataFrame()))) for k in SECTION_LABELS]
     boxes = [
         html.Div([
-            html.Div(str(v), style={"fontSize": "1.3rem", "fontWeight": "700",
-                                     "color": ACC if v != "err" else "#e07070"}),
+            html.Div(str(v), style={"fontSize": "1.3rem", "fontWeight": "700", "color": ACC}),
             html.Div(k, style={"fontSize": "0.68rem", "color": SOFT}),
         ], style={"textAlign": "center", "flex": "1", "minWidth": "100px"})
         for k, v in stats
     ]
     return html.Div(card([
         html.H5(info["name"], style={"color": MAIN, "marginBottom": "0.1rem"}),
-        html.P(f"MMSI {info['mmsi']} | IMO {info.get('imo') or '?'} | "
-               f"Flag {info.get('flag') or '?'} | {start} -> {end}",
+        html.P(f"MMSI {info['mmsi']} | IMO {info.get('imo') or '?'} | Flag {info.get('flag') or '?'}",
                style={"color": DIM, "fontSize": "0.75rem", "marginBottom": "0.8rem"}),
         html.Div(boxes, style={"display": "flex", "gap": "0.5rem", "flexWrap": "wrap"}),
+        html.P("Fishing events aren't included: detecting genuine fishing activity needs "
+               "GFW's own classification model, not just raw AIS positions.",
+               style={"color": DIM, "fontSize": "0.68rem", "fontStyle": "italic", "marginTop": "0.6rem"}),
     ]))
 
 
-def _render_report(info, start, end, results):
+def _render_report(info, results):
     return html.Div([
-        _summary_bar(info, start, end, results),
-        html.Div([_section_table(key, *results[key]) for key in EVENT_DATASETS],
+        _summary_bar(info, results),
+        html.Div([_section_table(key, results.get(key)) for key in SECTION_LABELS],
                  style={"minWidth": "0"}),
     ], style={"minWidth": "0"})
 
@@ -319,33 +353,43 @@ def _render_report(info, start, end, results):
 
 def register_callbacks(app):
 
+    # Parse le CSV dès qu'il est déposé -- peuple la liste des navires
+    # trouvés. Le rapport lui-même n'est calculé qu'au clic sur
+    # "Generate Report", plus bas.
     @app.callback(
+        Output("vr-csv-filename", "children"),
         Output("vr-vessel-selector", "options"),
         Output("vr-vessel-selector", "value"),
         Output("vr-search-store", "data"),
-        Output("vr-status", "children"),
-        Input("vr-btn-search", "n_clicks"),
-        State("vr-query", "value"),
+        Output("vr-csv-loaded", "data"),
+        Input("vr-csv-upload", "contents"),
+        State("vr-csv-upload", "filename"),
         prevent_initial_call=True,
     )
-    def _search(n, query):
-        if not n:
+    def _on_csv_uploaded(contents, filename):
+        if not contents:
             raise dash.exceptions.PreventUpdate
-        api_key = get_api_key()
-        if not api_key:
-            return [], None, None, "No API key saved."
-        if not query or not str(query).strip():
-            return [], None, None, "Enter a name, MMSI or IMO first."
         try:
-            df = do_search_vessel(str(query).strip(), api_key)
+            df = _parse_uploaded_csv(contents, filename)
         except Exception as e:
-            return [], None, None, "Search failed: " + str(e)[:70]
+            _CSV_CACHE["df"] = None
+            return f"Error: {e}", [], None, None, None
 
-        entries = _group_results_by_mmsi(df)
+        required = {"lat", "lon", "vessel_id", "date"}
+        if not required.issubset(df.columns):
+            _CSV_CACHE["df"] = None
+            missing = ", ".join(sorted(required - set(df.columns)))
+            return f'"{filename}" is missing required column(s): {missing}.', [], None, None, None
+
+        _CSV_CACHE["df"] = df
+        _CSV_CACHE["filename"] = filename
+
+        entries = _find_vessels_in_csv(df)
         if not entries:
-            return [], None, None, "No vessel found."
+            return f'"{filename}" loaded, but no vessel_id found in it.', [], None, None, None
         opts = [{"label": e["label"], "value": str(i)} for i, e in enumerate(entries)]
-        return opts, None, entries, f"{len(entries)} vessel(s) found."
+        return (f"Loaded: {len(df):,} rows from \"{filename}\" ({len(entries)} vessel(s)).",
+                opts, None, entries, "loaded")
 
     @app.callback(
         Output("vr-selected", "children"),
@@ -366,28 +410,43 @@ def register_callbacks(app):
         Input("vr-btn-run", "n_clicks"),
         State("vr-vessel-selector", "value"),
         State("vr-search-store", "data"),
-        State("vr-start", "date"),
-        State("vr-end", "date"),
         prevent_initial_call=True,
     )
-    def _run(n, idx, entries, start, end):
+    def _run(n, idx, entries):
         if not n:
             raise dash.exceptions.PreventUpdate
-        api_key = get_api_key()
-        if not api_key:
-            return dash.no_update, "No API key saved.", None
+        full_df = _CSV_CACHE.get("df")
+        if full_df is None or full_df.empty:
+            return dash.no_update, "Import a CSV first.", None
         if idx is None or not entries:
             return dash.no_update, "Select a vessel first.", None
-        if not start or not end:
-            return dash.no_update, "Please choose a start and end date.", None
 
         info = entries[int(idx)]
-        results = do_full_report(info["ids"], start, end, api_key)
+        vessel_id = info["ids"][0]
+        df_vessel = full_df[full_df["vessel_id"] == vessel_id]
+        if df_vessel.empty:
+            return dash.no_update, "No rows for this vessel in the imported CSV.", None
+
+        results = {}
+        results["port_visit"] = _detect_port_visits_local(df_vessel)
+        results["gap"] = _detect_gaps_local(df_vessel)
+
+        loi = get_loitering_dataframe(df_vessel)
+        results["loitering"] = loi.drop(columns=["vessel_id"], errors="ignore") if not loi.empty else loi
+
+        enc_cols = ["lat", "lon", "vessel_id", "ship_name", "date"]
+        if set(enc_cols).issubset(full_df.columns):
+            enc = get_encounters_dataframe(full_df[enc_cols])
+            if not enc.empty:
+                enc = enc[(enc["vessel_1_id"] == vessel_id) | (enc["vessel_2_id"] == vessel_id)]
+            results["encounter"] = enc
+        else:
+            results["encounter"] = pd.DataFrame()
 
         # Store combine pour l'export : chaque df avec une colonne event_type
         combined_frames = []
-        for key, (df, err) in results.items():
-            if err or df is None or df.empty:
+        for key, df in results.items():
+            if df is None or df.empty:
                 continue
             d = df.copy()
             d.insert(0, "event_type", SECTION_LABELS[key])
@@ -395,11 +454,8 @@ def register_callbacks(app):
         store = (pd.concat(combined_frames, ignore_index=True, sort=False)
                  .to_dict("records")) if combined_frames else None
 
-        n_errors = sum(1 for _, (_, e) in results.items() if e)
-        status = (f"Report generated ({n_errors} section(s) failed)."
-                  if n_errors else "Report generated.")
-
-        return _render_report(info, start, end, results), status, store
+        status = "Report generated."
+        return _render_report(info, results), status, store
 
     @app.callback(
         Output("vr-download-csv", "data"),
@@ -411,148 +467,3 @@ def register_callbacks(app):
         if not n or not store:
             raise dash.exceptions.PreventUpdate
         return dcc.send_data_frame(pd.DataFrame(store).to_csv, "vessel_report.csv", index=False)
-
-
-# ── GFW FUNCTIONS (async) ────────────────────────────────────────────────────
-
-async def search_vessel(query, client):
-    """Identique aux autres pages -- recherche de navire GFW."""
-    result = await client.vessels.search_vessels(
-        query=query,
-        datasets=["public-global-vessel-identity:latest"],
-        includes=["OWNERSHIP", "MATCH_CRITERIA"],
-    )
-    df = result.df()
-    if df.empty:
-        return df
-
-    def _d(x):
-        if hasattr(x, "model_dump"):
-            return x.model_dump()
-        return x if isinstance(x, dict) else {}
-
-    rows = []
-    for _, r in df.iterrows():
-        d = r.to_dict()
-
-        owners = d.get("registry_owners") or []
-        owner_name = _d(owners[-1]).get("name") if owners else None
-
-        registry = d.get("registry_info") or []
-        reg = _d(registry[-1]) if registry else {}
-        reg_imo = reg.get("imo")
-        reg_length = reg.get("length_m")
-        reg_tonnage = reg.get("tonnage_gt")
-
-        gear_by_vid, ship_by_vid = {}, {}
-
-        for c in (d.get("combined_sources_info") or []):
-            c = _d(c)
-            vid = c.get("vessel_id")
-            gears = c.get("gear_types") or []
-            ships = c.get("ship_types") or []
-            if gears:
-                gear_by_vid[vid] = _d(gears[-1]).get("name")
-            if ships:
-                ship_by_vid[vid] = _d(ships[-1]).get("name")
-
-        for i in (d.get("self_reported_info") or []):
-            i = _d(i)
-            vid = i.get("id")
-            rows.append({
-                "vessel_id": vid,
-                "ship_name": i.get("ship_name"),
-                "mmsi": i.get("ssvid"),
-                "imo": i.get("imo") or reg_imo,
-                "call_sign": i.get("call_sign"),
-                "flag": i.get("flag"),
-                "vessel_type": ship_by_vid.get(vid),
-                "gear_type": gear_by_vid.get(vid),
-                "length_m": reg_length,
-                "tonnage_gt": reg_tonnage,
-                "owner": owner_name,
-                "from": i.get("transmission_date_from"),
-                "to": i.get("transmission_date_to"),
-            })
-
-    out = pd.DataFrame(rows)
-    out = out[out["vessel_id"].notna()].drop_duplicates(subset=["vessel_id"])
-    return out
-
-
-def _flatten_generic(df, type_hint):
-    """
-    Flatten generique du sous-objet specifique a l'evenement (ex: colonne
-    'fishing', 'loitering', 'encounter', 'port_visit' ou 'gap'), sans
-    presumer des noms de champs exacts -- json_normalize expose tout ce que
-    l'API renvoie, prefixe par type_hint.
-    """
-    def _d(x):
-        if hasattr(x, "model_dump"):
-            return x.model_dump()
-        return x if isinstance(x, dict) else {}
-
-    candidates = [c for c in df.columns if c not in ("start", "end", "lat", "lon", "id", "type")
-                  and df[c].apply(lambda x: hasattr(x, "model_dump") or isinstance(x, dict)).any()]
-
-    sub_col = None
-    for c in candidates:
-        if type_hint.replace("_", "") in c.lower().replace("_", ""):
-            sub_col = c
-            break
-    if sub_col is None and candidates:
-        sub_col = candidates[0]
-
-    if sub_col:
-        flat = pd.json_normalize(df[sub_col].apply(_d))
-        flat.index = df.index
-        flat = flat.add_prefix(f"{type_hint}_")
-        df = pd.concat([df.drop(columns=[sub_col]), flat], axis=1)
-
-    if "start" in df.columns:
-        df["start"] = pd.to_datetime(df["start"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M")
-    if "end" in df.columns:
-        df["end"] = pd.to_datetime(df["end"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M")
-
-    return df
-
-
-def _sanitize_for_display(df):
-    """
-    Certains champs GFW imbriquent un dict a l'interieur d'une LISTE
-    (ex: 'distances': [{...}]). json_normalize aplatit les dicts directs
-    mais pas les dicts caches dans une liste -- ces cellules restent des
-    objets Python bruts, que React/Dash ne peuvent pas afficher tels quels
-    (erreur React #31 "object with keys ..."). On les convertit en texte
-    JSON lisible avant tout affichage ou export.
-    """
-    import json as _json
-    for col in df.columns:
-        if df[col].apply(lambda v: isinstance(v, (dict, list))).any():
-            df[col] = df[col].apply(
-                lambda v: _json.dumps(v, default=str) if isinstance(v, (dict, list)) else v)
-    return df
-
-
-async def load_events(dataset, type_hint, vessel_ids, start, end, client):
-    """Charge un type d'evenement GFW pour un ou plusieurs vessel_id."""
-    if isinstance(vessel_ids, str):
-        vessel_ids = [vessel_ids]
-
-    events = await client.events.get_all_events(
-        datasets=[dataset],
-        vessels=vessel_ids,
-        start_date=start,
-        end_date=end,
-        limit=99999,
-    )
-
-    df = events.df()
-    if df.empty:
-        return df
-
-    df = _flatten_generic(df.copy(), type_hint)
-    df = _sanitize_for_display(df)
-    if "start" in df.columns:
-        df = df.sort_values("start")
-    return df

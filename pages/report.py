@@ -5,15 +5,15 @@ Page "Reports" -- two independent report generators, side by side (same
 visual pattern as the Data (download) page):
 
 - LEFT panel  : VP Report    -- per-vessel AIS-gap / suspicious-gap /
-                tracked-activity / encounter-events report, from a
-                downloaded "Vessel Presence" CSV.
-- RIGHT panel : AFE Report   -- fishing effort by zone/country, from a
-                downloaded "Fishing Effort" CSV (needs an 'hours' column).
+                tracked-activity / encounter-events report, from an
+                imported "Vessel Presence" CSV.
+- RIGHT panel : AFE Report   -- fishing effort by zone/country, from an
+                imported "Fishing Effort" CSV (needs an 'hours' column).
 
-Both panels list every CSV already downloaded via the Data page (no
-automatic filtering by content -- the user picks whichever file is
-relevant for the report they want, exactly like the two download panels
-on the Data page).
+v2 -- no more "browse already-downloaded CSVs on disk" (native OS file
+dialog restricted to ROOT / "data"): both panels now use a drag & drop
+CSV upload, exactly like pages/heatmap.py (in-memory parse + server-side
+cache, no dependency on files pre-downloaded via the old Data page).
 
 NOTE on the VP report:
 The original standalone script (VP_report.py) imported
@@ -32,6 +32,9 @@ scripts. Adjust BUFFER_DIS or the path below if that's not where it
 lives in this project.
 """
 
+import base64
+import io
+
 import dash
 import numpy as np
 import pandas as pd
@@ -41,34 +44,6 @@ from dash import dcc, html, Input, Output, State, dash_table
 
 from shared import BG, PANEL, BDR, DIM, MAIN, SOFT, ACC, lbl, GFW_DOWNLOAD_DIR
 from config import ROOT, ZONES, FLAG_NAMES
-from gfw import load_csv
-
-
-def _open_native_csv_dialog(initial_dir):
-    """
-    Opens the OS's native "Open file" dialog (Windows Explorer style,
-    same as any desktop app) restricted to CSV files, and returns the
-    chosen path as a string, or None if the user cancelled.
-
-    Only works when the Dash app is run locally (server and browser on
-    the same machine) since tkinter needs a display on the machine
-    where this code executes.
-    """
-    import tkinter as tk
-    from tkinter import filedialog
-
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
-    try:
-        path = filedialog.askopenfilename(
-            title="Ouvrir",
-            initialdir=str(initial_dir) if Path(initial_dir).exists() else str(ROOT),
-            filetypes=[("Fichiers CSV", "*.csv"), ("Tous les fichiers", "*.*")],
-        )
-    finally:
-        root.destroy()
-    return path or None
 
 STANDARD_CRS = "EPSG:4326"
 
@@ -86,10 +61,28 @@ REPORT_ZONE_KEYS = [
     "malta_national",
 ]
 
+# Cache serveur des CSV importés, comme _CSV_CACHE dans pages/heatmap.py --
+# évite l'aller-retour des dataframes par le navigateur. Un slot par
+# panneau (VP / AFE), chacun garde son propre fichier.
+_CSV_CACHE = {"vp_df": None, "vp_filename": None, "afe_df": None, "afe_filename": None}
+
+
+def _parse_uploaded_csv(contents, filename):
+    """Identique à heatmap._parse_uploaded_csv (dcc.Upload -> DataFrame)."""
+    if contents is None:
+        return None
+    _, content_string = contents.split(",", 1)
+    decoded = base64.b64decode(content_string)
+    if filename and filename.lower().endswith((".tsv", ".txt")):
+        return pd.read_csv(io.BytesIO(decoded), sep=None, engine="python")
+    return pd.read_csv(io.BytesIO(decoded))
+
 
 # SHARED HELPERS
 def _load_zone_polygon(zone_key):
-    """Load the shapefile for the given zone key and return a unified polygon (or None)."""
+    """Load the shapefile for the given zone key and return a unified polygon (or None).
+    This is the zone's own boundary definition (report zones), not vessel
+    data, so it's unrelated to the CSV import above."""
     cfg = ZONES.get(zone_key)
     if not cfg or not cfg.get("shp"):
         return None
@@ -224,6 +217,10 @@ def build_vp_report(df, filter_type="All Vessels", buffer_dis=BUFFER_DIS,
       Vessel Id, Vessel Name, MMSI, Country,
       Gap Hours (outside AIS buffer), Total Gap Hours,
       Tracked Activity (Hrs), Encounter Events
+
+    start_date / end_date are display-only metadata, derived from the
+    imported CSV's own "date" column (min/max) -- there is no interactive
+    date-range filter on this page.
     """
     empty_cols = ["Vessel Id", "Vessel Name", "MMSI", "Country",
                   "Gap Hours (outside AIS buffer)", "Total Gap Hours",
@@ -314,7 +311,7 @@ def build_vp_report(df, filter_type="All Vessels", buffer_dis=BUFFER_DIS,
         "suspicious_gap_hrs", "total_gap_hrs", "total_activity_hrs", "encounter_events",
     ]].sort_values("suspicious_gap_hrs", ascending=False)
 
-    report.columns = empty_cols
+    report.columns = empty_cols[:8]
     for c in ["Gap Hours (outside AIS buffer)", "Total Gap Hours", "Tracked Activity (Hrs)"]:
         report[c] = report[c].round(2)
 
@@ -359,11 +356,22 @@ def _panel_style():
             "padding": "1.2rem", "flex": "1", "minWidth": "320px"}
 
 
-def _browse_button_style():
-    return {"width": "100%", "padding": "0.55rem", "background": PANEL,
-            "color": MAIN, "border": f"1px solid {BDR}", "borderRadius": "6px",
-            "cursor": "pointer", "fontWeight": "600", "marginBottom": "0.4rem",
-            "textAlign": "left"}
+def _upload_zone(upload_id):
+    return dcc.Upload(
+        id=upload_id,
+        children=html.Div([
+            "Drag a CSV here, or ",
+            html.A("browse", style={"color": ACC, "textDecoration": "underline"}),
+        ]),
+        style={
+            "width": "100%", "padding": "1rem 0.5rem",
+            "textAlign": "center", "cursor": "pointer",
+            "border": f"1px dashed {BDR}", "borderRadius": "6px",
+            "color": SOFT, "fontSize": "0.75rem",
+            "marginBottom": "0.4rem",
+        },
+        multiple=False,
+    )
 
 
 def _selected_file_style():
@@ -377,12 +385,11 @@ def _classic_layout():
     return html.Div([
         dcc.Download(id="vp-report-download"),
         dcc.Download(id="afe-report-download"),
-        dcc.Store(id="vp-report-csv"),
-        dcc.Store(id="afe-report-csv"),
+        dcc.Store(id="vp-report-csv-loaded"),
+        dcc.Store(id="afe-report-csv-loaded"),
 
         html.H5("Reports", style={"color": MAIN, "marginBottom": "0.3rem"}),
-        html.P("Build a report from a CSV already downloaded on the Data page. "
-               "The report is downloaded directly by your browser.",
+        html.P("Import a CSV to build a report. The report is downloaded directly by your browser.",
                style={"color": DIM, "fontSize": "0.8rem", "marginBottom": "1.2rem"}),
 
         html.Div([
@@ -393,10 +400,9 @@ def _classic_layout():
                 html.P("AIS gaps, tracked activity and encounter events, per vessel.",
                        style={"fontSize": "0.75rem", "color": DIM, "marginBottom": "1rem"}),
 
-                lbl("Downloaded CSV (Vessel Presence)"),
-                html.Button([html.Span("📁 "), "Parcourir..."], id="vp-browse-btn",
-                    n_clicks=0, style=_browse_button_style()),
-                html.Div("Aucun fichier selectionne", id="vp-selected-file",
+                lbl("Import a CSV (Vessel Presence)"),
+                _upload_zone("vp-csv-upload"),
+                html.Div("No file selected", id="vp-selected-file",
                     style=_selected_file_style()),
 
                 lbl("Vessel selection"),
@@ -421,10 +427,9 @@ def _classic_layout():
                 html.P(f"Fishing effort by zone and country. Zones: {zones_txt}.",
                        style={"fontSize": "0.75rem", "color": DIM, "marginBottom": "1rem"}),
 
-                lbl("Downloaded CSV (Fishing Effort)"),
-                html.Button([html.Span("📁 "), "Parcourir..."], id="afe-browse-btn",
-                    n_clicks=0, style=_browse_button_style()),
-                html.Div("Aucun fichier selectionne", id="afe-selected-file",
+                lbl("Import a CSV (Fishing Effort)"),
+                _upload_zone("afe-csv-upload"),
+                html.Div("No file selected", id="afe-selected-file",
                     style=_selected_file_style()),
 
                 html.Button("Generate AFE Report", id="afe-report-run", n_clicks=0,
@@ -449,7 +454,7 @@ def _classic_layout():
 
 def layout():
     """Point d'entree de la page 'Report' : un selecteur en haut permet de
-    basculer entre le rapport classique (VP/AFE depuis un CSV telecharge)
+    basculer entre le rapport classique (VP/AFE depuis un CSV importe)
     et le rapport par navire (recherche + evenements GFW), sans occuper
     deux onglets separes dans la barre de navigation."""
     from pages import vessel_report as page_vessel_report
@@ -477,6 +482,9 @@ def layout():
         html.Div(id="report-mode-content", children=_classic_layout(),
                   style={"minWidth": "0"}),
     ], style={"display": "flex", "flexDirection": "column", "minWidth": "0"})
+
+
+def _afe_table(long_df):
     if long_df is None or long_df.empty:
         return html.P("No fishing effort found in the configured zones for this CSV.",
                       style={"color": SOFT, "fontSize": "0.85rem"})
@@ -517,19 +525,20 @@ def _vp_table(report_df, totals, meta):
 
 
 # ---------------------------------------------------------------------------
-# DIRECT-TO-DISK WRITERS (same pattern as the Data page: no browser save
-# dialog, the report CSV is written straight into GFW_DOWNLOAD_DIR)
+# DIRECT-TO-DISK WRITERS (the generated report CSV is both sent to the
+# browser and saved into GFW_DOWNLOAD_DIR -- this is an export of the
+# report Claude just built, unrelated to the imported-CSV input above)
 # ---------------------------------------------------------------------------
-def _save_afe_report(matrix_df, source_csv_path):
-    stem = Path(source_csv_path).stem
+def _save_afe_report(matrix_df, source_filename):
+    stem = Path(source_filename).stem
     fname = f"AFE_report_{stem}.csv"
     out_path = GFW_DOWNLOAD_DIR / fname
     matrix_df.to_csv(out_path, index=False, header=False)
     return out_path
 
 
-def _save_vp_report(report_df, totals, meta, source_csv_path):
-    stem = Path(source_csv_path).stem
+def _save_vp_report(report_df, totals, meta, source_filename):
+    stem = Path(source_filename).stem
     fname = f"VP_report_{stem}.csv"
     out_path = GFW_DOWNLOAD_DIR / fname
     with open(out_path, "w", encoding="utf-8", newline="") as f:
@@ -560,29 +569,46 @@ def register_callbacks(app):
             return page_vessel_report.layout()
         return _classic_layout()
 
+    # Parse le CSV VP dès qu'il est déposé, mis en cache serveur -- le
+    # rapport lui-même n'est construit qu'au clic sur "Generate VP Report".
     @app.callback(
-        Output("vp-report-csv", "data"),
         Output("vp-selected-file", "children"),
-        Input("vp-browse-btn", "n_clicks"),
+        Output("vp-report-csv-loaded", "data"),
+        Input("vp-csv-upload", "contents"),
+        State("vp-csv-upload", "filename"),
         prevent_initial_call=True,
     )
-    def _browse_vp_csv(n_clicks):
-        path = _open_native_csv_dialog(ROOT / "data")
-        if not path:
+    def _on_vp_csv_uploaded(contents, filename):
+        if not contents:
             raise dash.exceptions.PreventUpdate
-        return path, path
+        try:
+            df = _parse_uploaded_csv(contents, filename)
+        except Exception as e:
+            _CSV_CACHE["vp_df"] = None
+            return f"Error: {e}", None
+        _CSV_CACHE["vp_df"] = df
+        _CSV_CACHE["vp_filename"] = filename
+        return f"Loaded: {len(df):,} rows from \"{filename}\"", "loaded"
 
+    # Idem pour le CSV AFE.
     @app.callback(
-        Output("afe-report-csv", "data"),
         Output("afe-selected-file", "children"),
-        Input("afe-browse-btn", "n_clicks"),
+        Output("afe-report-csv-loaded", "data"),
+        Input("afe-csv-upload", "contents"),
+        State("afe-csv-upload", "filename"),
         prevent_initial_call=True,
     )
-    def _browse_afe_csv(n_clicks):
-        path = _open_native_csv_dialog(ROOT / "data")
-        if not path:
+    def _on_afe_csv_uploaded(contents, filename):
+        if not contents:
             raise dash.exceptions.PreventUpdate
-        return path, path
+        try:
+            df = _parse_uploaded_csv(contents, filename)
+        except Exception as e:
+            _CSV_CACHE["afe_df"] = None
+            return f"Error: {e}", None
+        _CSV_CACHE["afe_df"] = df
+        _CSV_CACHE["afe_filename"] = filename
+        return f"Loaded: {len(df):,} rows from \"{filename}\"", "loaded"
 
     @app.callback(
         Output("report-table", "children"),
@@ -592,42 +618,36 @@ def register_callbacks(app):
         Output("vp-report-download", "data"),
         Input("afe-report-run", "n_clicks"),
         Input("vp-report-run", "n_clicks"),
-        State("afe-report-csv", "data"),
-        State("vp-report-csv", "data"),
         State("vp-report-filter", "value"),
         prevent_initial_call=True,
     )
-    def _run(n_afe, n_vp, afe_csv, vp_csv, vp_filter):
+    def _run(n_afe, n_vp, vp_filter):
         ctx = dash.callback_context
         if not ctx.triggered:
             raise dash.exceptions.PreventUpdate
         trigger = ctx.triggered[0]["prop_id"].split(".")[0]
 
         if trigger == "afe-report-run":
-            if not afe_csv:
-                return dash.no_update, "Please choose a CSV.", dash.no_update, dash.no_update, dash.no_update
-            try:
-                df = load_csv(afe_csv)
-            except Exception as e:
-                return dash.no_update, f"CSV error: {str(e)[:80]}", dash.no_update, dash.no_update, dash.no_update
+            df = _CSV_CACHE.get("afe_df")
+            filename = _CSV_CACHE.get("afe_filename") or "report.csv"
+            if df is None:
+                return dash.no_update, "Please import a CSV first.", dash.no_update, dash.no_update, dash.no_update
 
             long_df, matrix_df = build_report(df)
             if long_df.empty:
                 return _afe_table(None), "No vessels in the configured zones.", dash.no_update, dash.no_update, dash.no_update
 
-            out_path = _save_afe_report(matrix_df, afe_csv)
+            out_path = _save_afe_report(matrix_df, filename)
             status = (f"{len(long_df)} vessel-rows across {long_df['Zone'].nunique()} zone(s). "
                       f"Downloaded (also saved to {out_path.name}).")
             download = dcc.send_file(str(out_path))
             return _afe_table(long_df), status, dash.no_update, download, dash.no_update
 
         if trigger == "vp-report-run":
-            if not vp_csv:
-                return dash.no_update, dash.no_update, "Please choose a CSV.", dash.no_update, dash.no_update
-            try:
-                df = load_csv(vp_csv)
-            except Exception as e:
-                return dash.no_update, dash.no_update, f"CSV error: {str(e)[:80]}", dash.no_update, dash.no_update
+            df = _CSV_CACHE.get("vp_df")
+            filename = _CSV_CACHE.get("vp_filename") or "report.csv"
+            if df is None:
+                return dash.no_update, dash.no_update, "Please import a CSV first.", dash.no_update, dash.no_update
 
             date_col = df["date"] if "date" in df.columns else None
             start_txt = str(date_col.min())[:10] if date_col is not None else "N/A"
@@ -639,7 +659,7 @@ def register_callbacks(app):
             if report_df.empty:
                 return _vp_table(None, {}, meta), dash.no_update, meta, dash.no_update, dash.no_update
 
-            out_path = _save_vp_report(report_df, totals, meta, vp_csv)
+            out_path = _save_vp_report(report_df, totals, meta, filename)
             status = f"{len(report_df)} vessel(s) in report. Downloaded (also saved to {out_path.name})."
             download = dcc.send_file(str(out_path))
             return _vp_table(report_df, totals, meta), dash.no_update, status, dash.no_update, download
