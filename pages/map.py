@@ -38,9 +38,9 @@ from config import VESSEL_TYPES, TYPE_COLORS, DEFAULT_COLOR, FLAG_NAMES, ZONES, 
 from gfw import GEAR_TYPES
 from loader import load_geojson
 
-# Reuse the same north-arrow/title helpers as pages/heatmap.py so both
+# Reuse the same title helpers as pages/heatmap.py so both
 # "Open map" buttons produce visually consistent, report-ready maps.
-from pages.heatmap import north_arrow_element, title_box_element, base_tile_layers, layer_control_contrast_css
+from pages.heatmap import title_box_element, base_tile_layers, layer_control_contrast_css
 
 MAX_POINTS = 60_000    # max number of points shown as scatter (sampled beyond that)
 MAX_PATHS_FAST = 500   # max number of vessels drawn as paths in "fast" mode (checkbox unticked)
@@ -392,10 +392,6 @@ def _build_full_trajectory_map_html(df, gear, show_all_paths, title):
     positions + trajectories: base-layer switcher, points/lines colored
     by vessel type, a categorical legend, north arrow and scale bar.
     Returns (url, error).
-
-    Zone polygons are NOT drawn here (their geometry isn't available in
-    this module, only their legend color via `ZONES`) -- see module
-    docstring.
     """
     try:
         import folium
@@ -457,161 +453,4 @@ def _build_full_trajectory_map_html(df, gear, show_all_paths, title):
     # Categorical legend (vessel types actually present in the selection)
     present_types = sorted(df_plot["_vtype"].unique().tolist())
     rows_html = "".join(
-        f'<div style="display:flex;align-items:center;margin-bottom:4px;">'
-        f'<span style="width:11px;height:11px;border-radius:50%;margin-right:6px;'
-        f'background:{_rgba_to_hex(TYPE_COLORS.get(t, DEFAULT_COLOR))};"></span>'
-        f'<span style="font-size:11px;">{t.title()}</span></div>'
-        for t in present_types
-    )
-    zone_rows_html = "".join(
-        f'<div style="display:flex;align-items:center;margin-bottom:4px;">'
-        f'<span style="width:11px;height:11px;border-radius:2px;margin-right:6px;'
-        f'background:{_rgba_to_hex(line_color)};"></span>'
-        f'<span style="font-size:11px;">{label}</span></div>'
-        for label, line_color in zones_drawn
-    )
-    legend_html = f"""
-    <div style="position: fixed; bottom: 24px; left: 16px; z-index: 9999;
-                background: white; padding: 10px 12px; border-radius: 6px;
-                box-shadow: 0 1px 5px rgba(0,0,0,0.35); font-family: sans-serif;
-                max-height: 40vh; overflow-y: auto;">
-      <div style="font-weight:700; font-size:11px; text-transform:uppercase;
-                  letter-spacing:0.04em; margin-bottom:6px;">Vessel type</div>
-      {rows_html}
-      {f'<div style="font-weight:700; font-size:11px; text-transform:uppercase; letter-spacing:0.04em; margin:10px 0 6px;">Zones</div>{zone_rows_html}' if zones_drawn else ''}
-    </div>
-    """
-    m.get_root().html.add_child(folium.Element(legend_html))
-
-    n_v = df_plot["vessel_id"].nunique() if "vessel_id" in df_plot.columns else None
-    subtitle = f"{len(df_plot):,} positions" + (f" · {n_v:,} vessels" if n_v else "")
-    m.get_root().html.add_child(title_box_element(title, subtitle))
-    m.get_root().html.add_child(north_arrow_element())
-
-    folium.LayerControl(collapsed=False).add_to(m)
-    m.get_root().header.add_child(layer_control_contrast_css())
-
-    FULL_MAP_DIR.mkdir(parents=True, exist_ok=True)
-    filename = f"{_slugify(title)}-{uuid.uuid4().hex[:8]}.html"
-    m.save(str(FULL_MAP_DIR / filename))
-    return f"{FULL_MAP_URL_PREFIX}/{filename}", None
-
-
-def _open_map_link_props(href):
-    if href:
-        return href, {"display": "inline-block", "border": "none",
-                       "background": "linear-gradient(135deg,#0d6efd,#0d4a7a)",
-                       "color": "white", "cursor": "pointer", "fontSize": "0.75rem",
-                       "fontWeight": "600", "textDecoration": "none",
-                       "padding": "0.3rem 1rem", "borderRadius": "5px"}
-    return "", {"display": "none"}
-
-
-def register_callbacks(app):
-
-    @app.callback(
-        Output("map-sidebar", "style"),
-        Output("map-toggle-sidebar", "children"),
-        Output("map-sidebar-open", "data"),
-        Input("map-toggle-sidebar", "n_clicks"),
-        State("map-sidebar-open", "data"),
-        prevent_initial_call=True,
-    )
-    def _toggle_sidebar(n, is_open):
-        now_open = not is_open
-        if now_open:
-            style = {"width": "260px", "minWidth": "260px", "padding": "1rem",
-                     "background": BG, "borderRight": f"1px solid {BDR}",
-                     "height": "calc(100vh - 52px)", "overflowY": "auto",
-                     "flexShrink": "0"}
-            arrow = "‹"
-        else:
-            style = {"width": "0px", "minWidth": "0px", "padding": "0",
-                     "background": BG, "borderRight": f"1px solid {BDR}",
-                     "height": "calc(100vh - 52px)", "overflow": "hidden",
-                     "flexShrink": "0"}
-            arrow = "›"
-        return style, arrow, now_open
-
-    # Parse the CSV as soon as it's dropped/browsed -- just caches it and
-    # shows the filename/row count. The map itself is only (re)built once
-    # "Show map" is clicked, below (so switching filters doesn't force a
-    # rebuild until you're ready).
-    @app.callback(
-        Output("map-csv-filename", "children"),
-        Output("map-csv-status", "children"),
-        Output("map-container", "children"),
-        Output("map-vessel-list", "children"),
-        Output("map-stats", "children"),
-        Output("map-store-filtered-df", "data"),
-        Output("map-open-map-link", "href"),
-        Output("map-open-map-link", "style"),
-        Input("map-csv-upload", "contents"),
-        State("map-csv-upload", "filename"),
-        prevent_initial_call=True,
-    )
-    def _on_csv_uploaded(contents, filename):
-        if not contents:
-            raise dash.exceptions.PreventUpdate
-        try:
-            df = _parse_uploaded_csv(contents, filename)
-        except Exception as e:
-            _CSV_CACHE["df"] = None
-            map_c, _ = _build_map(pd.DataFrame())
-            return ((filename or ""), f"Error: {e}", map_c, _vessel_list_table(pd.DataFrame()),
-                    "", None, *_open_map_link_props(None))
-
-        _CSV_CACHE["df"] = df
-        _CSV_CACHE["filename"] = filename
-        n_v = df["vessel_id"].nunique() if "vessel_id" in df.columns else len(df)
-        status = f"Loaded {len(df):,} rows · {n_v:,} vessel(s). Set your filters, then click \"Show map\"."
-        return ((filename or ""), status, dash.no_update, dash.no_update, dash.no_update,
-                dash.no_update, dash.no_update, dash.no_update)
-
-    # Build (or rebuild) the map -- only runs on "Show map".
-    @app.callback(
-        Output("map-container", "children", allow_duplicate=True),
-        Output("map-vessel-list", "children", allow_duplicate=True),
-        Output("map-stats", "children", allow_duplicate=True),
-        Output("map-store-filtered-df", "data", allow_duplicate=True),
-        Output("map-csv-status", "children", allow_duplicate=True),
-        Output("map-open-map-link", "href", allow_duplicate=True),
-        Output("map-open-map-link", "style", allow_duplicate=True),
-        Input("map-btn-show", "n_clicks"),
-        State("map-vessel-type", "value"),
-        State("map-gear", "value"),
-        State("map-show-all-paths", "value"),
-        State("map-csv-upload", "filename"),
-        prevent_initial_call=True,
-    )
-    def update_map(n, vessel_types, gear, show_all, filename):
-        if not n:
-            raise dash.exceptions.PreventUpdate
-        show_all_paths = "all" in (show_all or [])
-
-        df = _CSV_CACHE.get("df")
-        if df is None:
-            map_c, _ = _build_map(pd.DataFrame())
-            return (map_c, _vessel_list_table(pd.DataFrame()), "", None,
-                    "Import a CSV first.", *_open_map_link_props(None))
-
-        df = _apply_vessel_type_filter(df, vessel_types)
-        df = _apply_gear_filter(df, gear)
-        map_c, note = _build_map(df, show_all_paths)
-        n_v = df["vessel_id"].nunique() if "vessel_id" in df.columns else len(df)
-        stats_children = [html.P(f"{len(df):,} positions · {n_v:,} vessels (imported CSV)",
-                                  style={"color": SOFT, "fontSize": "0.78rem"})]
-        if note:
-            stats_children.append(html.P(note, style={"color": DIM, "fontSize": "0.7rem", "fontStyle": "italic"}))
-        status = f"Showing: {len(df):,} rows (filtered)"
-        _LAST_FILTERED_DF["df"] = df
-
-        title = f"Trajectories — {filename or 'Imported CSV'}"
-        href, map_err = (_build_full_trajectory_map_html(df, gear, show_all_paths, title)
-                         if not df.empty else (None, None))
-        if map_err:
-            status += f" ({map_err})"
-
-        return (map_c, _vessel_list_table(df), html.Div(stats_children),
-                (True if not df.empty else None), status,
-                *_open_map_link_props(href))
+        f'

@@ -58,9 +58,6 @@ GLOBAL_MAX_DATE = date(YEARS[-1], 12, 31)
 # in gfw.py) -- a long period combined with "all flags / all types" can
 # be very slow. Narrow flags/types or use the official source for a
 # wider scan.
-_TODAY = date.today()
-DEFAULT_END = min(_TODAY, GLOBAL_MAX_DATE)
-DEFAULT_START = max(DEFAULT_END - timedelta(days=60), GLOBAL_MIN_DATE)
 
 BUFFER_OPTIONS = [1, 3, 5, 10]
 

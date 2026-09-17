@@ -3,12 +3,12 @@ pages/data.py
 =============
 "Data" page: download from Global Fishing Watch.
 
-Deux colonnes cote a cote :
-  - GAUCHE : Vessel Presence (VP) -- presence AIS (comportement existant)
-  - DROITE : Apparent Fishing Effort (AFE) -- effort de peche
+Two side-by-side columns:
+  - LEFT  : Vessel Presence (VP) -- AIS presence (existing behaviour)
+  - RIGHT : Apparent Fishing Effort (AFE) -- fishing effort
 
-La cle API vient de get_api_key() (saisie une fois via la pop-up), il n'y a
-plus de champ cle sur cette page.
+The API key comes from get_api_key() (entered once via the pop-up); there is
+no API key field on this page anymore.
 """
 
 import asyncio
@@ -25,10 +25,10 @@ from dash import dcc, html, Input, Output, State
 from shared import BG, PANEL, BDR, DIM, MAIN, SOFT, ACC, lbl, card, GFW_DOWNLOAD_DIR
 from config import FLAG_NAMES
 from gfw import (get_gfw_client, bulk_load_data_to_csv, bulk_load_afe_to_csv,
-                GFW_VESSEL_TYPES, COUNTRY_FLAGS)
+                GFW_VESSEL_TYPES, COUNTRY_FLAGS, GEAR_TYPES)
 
 def _download_panel(prefix, title, subtitle, show_vtypes=True):
-    """prefix = 'vp' ou 'afe' -> sert à préfixer tous les id du panneau."""
+    """prefix = 'vp' or 'afe' -> used to prefix every id in the panel."""
     children = [
         html.H6(title, style={"color": MAIN, "marginBottom": "0.2rem"}),
         html.P(subtitle, style={"color": DIM, "fontSize": "0.75rem", "marginBottom": "1rem"}),
@@ -68,6 +68,21 @@ def _download_panel(prefix, title, subtitle, show_vtypes=True):
     else:
         children += [dcc.Store(id=f"{prefix}-vtypes", data=[])]
 
+    # Gear type: NOT filterable server-side (the GFW endpoint doesn't
+    # support it), but the API does return a "gear_type" column, so this
+    # is applied to the downloaded rows before the file is sent.
+    children += [
+        lbl("Gear type (leave empty for ALL)"),
+        dcc.Dropdown(id=f"{prefix}-gears",
+            options=[{"label": g.replace("_", " ").title(), "value": g}
+                     for g in GEAR_TYPES],
+            value=[], multi=True, placeholder="All gear types...",
+            style={"color": "#000", "marginBottom": "0.4rem"}),
+        html.P("Applied to the downloaded rows (GFW can't filter gear at "
+               "download time).",
+               style={"color": DIM, "fontSize": "0.7rem", "marginBottom": "1.2rem"}),
+    ]
+
     children += [
         html.Div([
             html.Button(f"Download {title}", id=f"{prefix}-btn", n_clicks=0,
@@ -86,7 +101,7 @@ def _download_panel(prefix, title, subtitle, show_vtypes=True):
                     style={"flex": "1", "minWidth": "340px"})
 
 
-# LAYOUT — deux colonnes
+# LAYOUT -- two columns
 def layout():
     return html.Div([
         dcc.Download(id="vp-file-download"),
@@ -101,7 +116,7 @@ def layout():
             _download_panel("vp", "Vessel Presence",
                             "AIS presence of vessels (positions).", show_vtypes=True),
             _download_panel("afe", "Fishing Effort (AFE)",
-                            "Apparent fishing effort (fishing vessels only).", show_vtypes=False),
+                            "Apparent fishing effort (fishing vessels only).", show_vtypes=True),
         ], style={"display": "flex", "gap": "1.5rem", "flexWrap": "wrap"}),
 
         html.Div(id="data-active-dataset",
@@ -113,9 +128,34 @@ def layout():
     ], style={"padding": "1.5rem", "background": BG, "minHeight": "calc(100vh - 52px)"})
 
 
-# Logique of download (VP or AFE) is in _do_download() below, called by the callbacks.
-def _do_download(kind, start, end, flags, vtypes):
-    """kind = 'VP' ou 'AFE'. Renvoie (message, csv_path_or_none, info)."""
+# Download logic (VP or AFE) lives in _do_download() below, called by the callbacks.
+def _post_filter_csv(csv_path, vtypes=None, gears=None):
+    """Applies the filters GFW can't apply at download time, directly on
+    the written CSV: gear_type (never filterable server-side) and, for
+    AFE, vessel_type (bulk_load_afe_to_csv takes no vessel_types param).
+    Rewrites the file in place. Returns the remaining row count."""
+    if not vtypes and not gears:
+        return None
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception:
+        return None
+    if df.empty:
+        return 0
+
+    if vtypes and "vessel_type" in df.columns:
+        wanted = [str(t).upper() for t in vtypes]
+        df = df[df["vessel_type"].astype(str).str.upper().isin(wanted)]
+    if gears and "gear_type" in df.columns:
+        wanted = [str(g).upper() for g in gears]
+        df = df[df["gear_type"].astype(str).str.upper().isin(wanted)]
+
+    df.to_csv(csv_path, index=False)
+    return len(df)
+
+
+def _do_download(kind, start, end, flags, vtypes, gears=None):
+    """kind = 'VP' or 'AFE'. Returns (message, csv_path_or_none, info)."""
     key = get_api_key()
     if not key:
         return "No API key saved.", None, None
@@ -168,6 +208,19 @@ def _do_download(kind, start, end, flags, vtypes):
     if result.get("error"):
         return f"Error: {result['error']}", None, None
 
+    # Filters GFW can't apply server-side: gear_type for both, plus
+    # vessel_type for AFE (bulk_load_afe_to_csv takes no vessel_types).
+    post_vtypes = vtypes if kind == "AFE" else None
+    kept = _post_filter_csv(result["path"], vtypes=post_vtypes, gears=gears)
+    if kept is not None:
+        if kept == 0:
+            p = Path(result["path"])
+            if p.exists():
+                p.unlink()
+            return ("No data left after the vessel type / gear type filter. "
+                    "Try widening the filters."), None, None
+        result["rows"] = kept
+
     msg = f"Download complete: {result['rows']:,} records saved."
     info = f"Active dataset: {result['fname']} ({result['rows']:,} rows) — {result['path']}"
     return msg, result["path"], info
@@ -197,15 +250,16 @@ def register_callbacks(app):
         Input("vp-btn", "n_clicks"),
         State("vp-start", "date"), State("vp-end", "date"),
         State("vp-flags", "value"), State("vp-vtypes", "value"),
+        State("vp-gears", "value"),
         prevent_initial_call=True,
     )
-    def _dl_vp(n, start, end, flags, vtypes):
+    def _dl_vp(n, start, end, flags, vtypes, gears):
         if not n:
             raise dash.exceptions.PreventUpdate
-        msg, path, info = _do_download("VP", start, end, flags, vtypes)
+        msg, path, info = _do_download("VP", start, end, flags, vtypes, gears)
         if path is None:
             return msg, dash.no_update
-        # lit le fichier en mémoire, l'envoie au navigateur, puis nettoie le disque
+        # read the file into memory, send it to the browser, then clean up disk
         send = dcc.send_file(path)
         try:
             os.remove(path)
@@ -219,13 +273,14 @@ def register_callbacks(app):
         Output("afe-file-download", "data"),
         Input("afe-btn", "n_clicks"),
         State("afe-start", "date"), State("afe-end", "date"),
-        State("afe-flags", "value"), State("afe-vtypes", "data"),
+        State("afe-flags", "value"), State("afe-vtypes", "value"),
+        State("afe-gears", "value"),
         prevent_initial_call=True,
     )
-    def _dl_afe(n, start, end, flags, vtypes):
+    def _dl_afe(n, start, end, flags, vtypes, gears):
         if not n:
             raise dash.exceptions.PreventUpdate
-        msg, path, info = _do_download("AFE", start, end, flags, vtypes)
+        msg, path, info = _do_download("AFE", start, end, flags, vtypes, gears)
         if path is None:
             return msg, dash.no_update
         send = dcc.send_file(path)
